@@ -740,6 +740,229 @@ func TestRealCouchDB(t *testing.T) {
 	})
 }
 
+// TestRealCouchDBPrimaryAnchorDeletion proves against the pinned CouchDB image
+// that deleting the last physical page anchor between two reads cannot lose the
+// next surviving document, in both native orders. Each subtest owns a fresh
+// disposable database so a deletion in one case cannot change another case.
+func TestRealCouchDBPrimaryAnchorDeletion(t *testing.T) {
+	base, dbName, adminAuth, readerUser, readerAuth, readerPassword := integrationConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		status, _, err := integrationRequest(cleanupCtx, http.MethodDelete, base+"/"+dbName, adminAuth, "", nil)
+		if err != nil || (status != http.StatusOK && status != http.StatusNotFound && status != http.StatusAccepted) {
+			t.Logf("cleanup drop database: status=%d err=%v", status, err)
+		}
+	})
+	ensureReaderUser(t, ctx, base, adminAuth, readerUser, readerPassword)
+
+	names := map[string]string{
+		"a-1": "alpha", "a-2": "bravo", "a-3": "charlie", "a-4": "delta",
+		"A-1": "upper-alpha", "b-2": "bee-two", "c-3": "cee-three",
+	}
+	seed := func() []map[string]any {
+		docs := []map[string]any{{"_id": "_design/mid", "views": map[string]any{}}}
+		for _, id := range []string{"a-1", "a-2", "a-3", "a-4"} {
+			docs = append(docs, map[string]any{"_id": id, "kind": "product", "name": names[id]})
+		}
+		return docs
+	}
+	// A design document sorts between "A-1" and "b-2" in native order, so the
+	// last physical row of the first page can be a management anchor.
+	managementSeed := []map[string]any{
+		{"_id": "A-1", "kind": "product", "name": names["A-1"]},
+		{"_id": "_design/mid", "views": map[string]any{}},
+		{"_id": "b-2", "kind": "product", "name": names["b-2"]},
+		{"_id": "c-3", "kind": "product", "name": names["c-3"]},
+	}
+	databaseNumber := 0
+	newSeededDatabase := func(t *testing.T, docs []map[string]any) string {
+		t.Helper()
+		databaseNumber++
+		name := dbName + "_" + strconv.Itoa(databaseNumber)
+		createDatabase(t, ctx, base, name, adminAuth)
+		t.Cleanup(func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cleanupCancel()
+			status, _, err := integrationRequest(cleanupCtx, http.MethodDelete, base+"/"+name, adminAuth, "", nil)
+			if err != nil || (status != http.StatusOK && status != http.StatusNotFound && status != http.StatusAccepted) {
+				t.Logf("cleanup drop database %q: status=%d err=%v", name, status, err)
+			}
+		})
+		grantMemberAccess(t, ctx, base, name, adminAuth, readerUser)
+		bulkDocs(t, ctx, base, name, adminAuth, docs)
+		return name
+	}
+	open := func(t *testing.T, name string, mutate ...func(*Config)) dal.DB {
+		t.Helper()
+		cfg := Config{
+			DatabaseURL:       base + "/" + name,
+			AllowLoopbackHTTP: true,
+			MaxRowsPerPage:    2,
+			MaxPages:          100,
+			Headers: func(context.Context) (map[string]string, error) {
+				return map[string]string{"Authorization": readerAuth}, nil
+			},
+		}
+		for _, apply := range mutate {
+			apply(&cfg)
+		}
+		db, err := NewDB(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if closer, ok := dal.As[io.Closer](db); ok {
+				_ = closer.Close()
+			}
+		})
+		return db
+	}
+	newReader := func(t *testing.T, db dal.DB, name string, descending bool, offset, limit int) dal.RecordsReader {
+		t.Helper()
+		builder := dal.From(dal.NewRootCollectionRef(name, "")).NewQuery().Offset(offset).Limit(limit)
+		if descending {
+			builder = builder.OrderBy(dal.DescendingField("_id"))
+		}
+		query := builder.SelectColumns(dal.Column{Expression: dal.Field("name")})
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = reader.Close() })
+		return reader
+	}
+	readWithProjection := func(t *testing.T, reader dal.RecordsReader, count int) []string {
+		t.Helper()
+		ids := make([]string, 0, count)
+		for i := 0; i < count; i++ {
+			id, data := nextPrimary(t, reader)
+			if !reflect.DeepEqual(data, map[string]any{"name": names[id]}) {
+				t.Fatalf("record %q projection = %#v; want exactly name", id, data)
+			}
+			ids = append(ids, id)
+		}
+		return ids
+	}
+	assertUnique := func(t *testing.T, ids []string) {
+		t.Helper()
+		seen := map[string]bool{}
+		for _, id := range ids {
+			if seen[id] {
+				t.Fatalf("document %q returned twice: %v", id, ids)
+			}
+			seen[id] = true
+		}
+	}
+
+	t.Run("ascending-anchor-deleted-between-pages", func(t *testing.T) {
+		name := newSeededDatabase(t, seed())
+		db := open(t, name)
+		reader := newReader(t, db, name, false, 0, 4)
+		ids := readWithProjection(t, reader, 2)
+		if !reflect.DeepEqual(ids, []string{"a-1", "a-2"}) {
+			t.Fatalf("first ids = %v", ids)
+		}
+		// The second emitted record is the last physical anchor of the page.
+		deleteDocument(t, ctx, base, name, adminAuth, ids[1])
+		ids = append(ids, readWithProjection(t, reader, 2)...)
+		if want := []string{"a-1", "a-2", "a-3", "a-4"}; !reflect.DeepEqual(ids, want) {
+			t.Fatalf("ids after deleting anchor %q = %v; want %v", "a-2", ids, want)
+		}
+		assertUnique(t, ids)
+		if _, err := reader.Next(); !errors.Is(err, dal.ErrNoMoreRecords) {
+			t.Fatalf("after all rows = %v; want EOF", err)
+		}
+	})
+
+	t.Run("descending-anchor-deleted-between-pages", func(t *testing.T) {
+		name := newSeededDatabase(t, seed())
+		db := open(t, name)
+		reader := newReader(t, db, name, true, 0, 4)
+		ids := readWithProjection(t, reader, 2)
+		if !reflect.DeepEqual(ids, []string{"a-4", "a-3"}) {
+			t.Fatalf("first ids = %v", ids)
+		}
+		deleteDocument(t, ctx, base, name, adminAuth, ids[1])
+		ids = append(ids, readWithProjection(t, reader, 2)...)
+		if want := []string{"a-4", "a-3", "a-2", "a-1"}; !reflect.DeepEqual(ids, want) {
+			t.Fatalf("ids after deleting anchor %q = %v; want %v", "a-3", ids, want)
+		}
+		assertUnique(t, ids)
+	})
+
+	t.Run("present-anchor-is-discarded-once", func(t *testing.T) {
+		name := newSeededDatabase(t, seed())
+		db := open(t, name)
+		reader := newReader(t, db, name, false, 0, 4)
+		ids := readWithProjection(t, reader, 4)
+		if want := []string{"a-1", "a-2", "a-3", "a-4"}; !reflect.DeepEqual(ids, want) {
+			t.Fatalf("ids = %v; want %v", ids, want)
+		}
+		assertUnique(t, ids)
+	})
+
+	t.Run("offset-survives-deletion-between-pages", func(t *testing.T) {
+		name := newSeededDatabase(t, seed())
+		db := open(t, name)
+		reader := newReader(t, db, name, false, 1, 3)
+		ids := readWithProjection(t, reader, 1)
+		if !reflect.DeepEqual(ids, []string{"a-2"}) {
+			t.Fatalf("first offset id = %v", ids)
+		}
+		deleteDocument(t, ctx, base, name, adminAuth, ids[0])
+		ids = append(ids, readWithProjection(t, reader, 2)...)
+		if want := []string{"a-2", "a-3", "a-4"}; !reflect.DeepEqual(ids, want) {
+			t.Fatalf("offset ids after deleting anchor = %v; want %v", ids, want)
+		}
+		assertUnique(t, ids)
+	})
+
+	t.Run("management-anchor-does-not-consume-limit", func(t *testing.T) {
+		name := newSeededDatabase(t, managementSeed)
+		db := open(t, name)
+		reader := newReader(t, db, name, false, 0, 3)
+		ids := readWithProjection(t, reader, 1)
+		if !reflect.DeepEqual(ids, []string{"A-1"}) {
+			t.Fatalf("first ids = %v", ids)
+		}
+		// The design document was the last physical row of the first page.
+		// It must be discarded without consuming the limit or losing b-2.
+		ids = append(ids, readWithProjection(t, reader, 2)...)
+		if want := []string{"A-1", "b-2", "c-3"}; !reflect.DeepEqual(ids, want) {
+			t.Fatalf("ids across management anchor = %v; want %v", ids, want)
+		}
+		assertUnique(t, ids)
+	})
+
+	t.Run("page-cap-one-refuses-rather-than-losing", func(t *testing.T) {
+		name := newSeededDatabase(t, seed())
+		db := open(t, name, func(cfg *Config) { cfg.MaxRowsPerPage = 1 })
+		reader := newReader(t, db, name, true, 0, 2)
+		if id, _ := nextPrimary(t, reader); id != "a-4" {
+			t.Fatalf("first id = %q", id)
+		}
+		if _, err := reader.Next(); !errors.Is(err, dal.ErrNotSupported) {
+			t.Fatalf("error = %v; a page cap of one must refuse explicitly, not report EOF", err)
+		}
+	})
+
+	t.Run("page-budget-refuses-mid-continuation", func(t *testing.T) {
+		name := newSeededDatabase(t, seed())
+		db := open(t, name, func(cfg *Config) { cfg.MaxPages = 2 })
+		reader := newReader(t, db, name, false, 0, 4)
+		ids := readWithProjection(t, reader, 2)
+		if !reflect.DeepEqual(ids, []string{"a-1", "a-2"}) {
+			t.Fatalf("ids = %v", ids)
+		}
+		if _, err := reader.Next(); !errors.Is(err, ErrTooManyPages) {
+			t.Fatalf("error = %v; want an explicit page-budget refusal, never EOF", err)
+		}
+	})
+}
+
 func integrationConfig(t *testing.T) (base, dbName, adminAuth, readerUser, readerAuth, readerPassword string) {
 	t.Helper()
 	rawURL := os.Getenv("COUCHDB_TEST_URL")

@@ -150,10 +150,21 @@ as `FROM orders LIMIT 5` works on an existing unindexed database.
   `_local/...` does not appear in `_all_docs`) and deleted documents are
   excluded **before** the logical application offset and limit. They never
   consume an offset slot or a result row, and no envelope document is invented.
-- Paging uses the native `_id` as the stable continuation key
-  (`startkey` plus skipping that already-seen key); each physical page also
-  validates that IDs stay in native ascending/descending order and never
-  repeat, so a hostile or out-of-order page fails instead of duplicating rows.
+- Paging uses the native `_id` as the stable **inclusive** continuation key:
+  the next page starts at the last physical `_id` (`startkey`) and discards
+  only that actual anchor row. If the anchor document was deleted between two
+  reads, CouchDB starts at the next surviving document and the adapter keeps
+  it, so a concurrent delete cannot silently drop that document. When the hard
+  `MaxRowsPerPage` allows it, one lookahead row may be requested so an
+  anchor-only page still advances; a request never exceeds `MaxRowsPerPage`.
+  Each physical page also validates that IDs stay in native
+  ascending/descending order and never repeat, so a hostile or out-of-order
+  page fails instead of duplicating rows.
+- A `MaxRowsPerPage` of one cannot advance past a still-present anchor without
+  reopening that delete race, so such a continuation is refused explicitly
+  with `dal.ErrNotSupported` instead of reporting a false EOF, duplicating a
+  row or looping silently. A single page, or a continuation whose anchor was
+  deleted, still completes normally at that cap.
 - `ORDER BY _id` descending is requested natively with `descending=true`.
   If an endpoint does not support native descending `_all_docs`, the request
   fails explicitly; rows are never silently returned in ascending order.

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,9 +43,11 @@ func primaryDeletedRow(id string) map[string]any {
 	}
 }
 
-// fakePrimary is a small native _all_docs fixture. It honours descending,
-// startkey and skip the way CouchDB does, so continuation and page accounting
-// are exercised rather than assumed.
+// fakePrimary is a small native _all_docs fixture. It keeps rows in native
+// _id order and honours descending, an inclusive startkey and skip the way
+// CouchDB does, so continuation and page accounting are exercised rather than
+// assumed. delete stands in for an external administrator changing the
+// database between two reads.
 type fakePrimary struct {
 	mu      sync.Mutex
 	rows    []map[string]any
@@ -55,6 +58,20 @@ type fakePrimary struct {
 
 func newFakePrimary(rows ...map[string]any) *fakePrimary {
 	return &fakePrimary{rows: rows}
+}
+
+// delete removes one document identity, as an external admin would between
+// two independent adapter requests.
+func (f *fakePrimary) delete(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	kept := f.rows[:0]
+	for _, row := range f.rows {
+		if row["id"] != id {
+			kept = append(kept, row)
+		}
+	}
+	f.rows = kept
 }
 
 func (f *fakePrimary) handler(t *testing.T) http.Handler {
@@ -82,6 +99,11 @@ func (f *fakePrimary) handler(t *testing.T) http.Handler {
 		if query.Get("include_docs") != "true" {
 			t.Errorf("include_docs = %q", query.Get("include_docs"))
 		}
+		// CouchDB _all_docs is always in native _id order, regardless of the
+		// insertion order of a fixture.
+		sort.Slice(rows, func(i, j int) bool {
+			return rows[i]["id"].(string) < rows[j]["id"].(string)
+		})
 		descending := query.Get("descending") == "true"
 		if descending {
 			for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
@@ -96,7 +118,14 @@ func (f *fakePrimary) handler(t *testing.T) http.Handler {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			for start < len(rows) && rows[start]["id"] != key {
+			// startkey is inclusive and does not require the key to exist:
+			// CouchDB starts at the first row at or after it in native order,
+			// so a deleted anchor continues with the next surviving document.
+			for start < len(rows) {
+				id := rows[start]["id"].(string)
+				if (!descending && id >= key) || (descending && id <= key) {
+					break
+				}
 				start++
 			}
 		}
@@ -143,6 +172,38 @@ func readPrimaryIDs(t *testing.T, reader dal.RecordsReader) []string {
 		}
 		ids = append(ids, rec.Key().ID.(string))
 	}
+}
+
+func nextPrimary(t *testing.T, reader dal.RecordsReader) (string, map[string]any) {
+	t.Helper()
+	rec, err := reader.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	id, ok := rec.Key().ID.(string)
+	if !ok {
+		t.Fatalf("key ID is %T, want string", rec.Key().ID)
+	}
+	return id, dataOf(t, rec)
+}
+
+// primaryRequestLimits returns every requested page limit and rejects a
+// continuation that used skip instead of the inclusive anchor contract.
+func primaryRequestLimits(t *testing.T, fixture *fakePrimary) []int {
+	t.Helper()
+	queries, _, _ := fixture.snapshot()
+	limits := make([]int, len(queries))
+	for i, query := range queries {
+		limit, err := strconv.Atoi(query.Get("limit"))
+		if err != nil || limit <= 0 {
+			t.Fatalf("request %d limit = %q", i, query.Get("limit"))
+		}
+		if query.Get("startkey") != "" && query.Get("skip") != "" {
+			t.Fatalf("request %d = %v; inclusive continuation must not use skip", i, query)
+		}
+		limits[i] = limit
+	}
+	return limits
 }
 
 func TestPrimaryRouteEligibility(t *testing.T) {
@@ -392,6 +453,318 @@ func TestPrimaryEnumerationNativeOrderAndManagementDocs(t *testing.T) {
 	})
 }
 
+// TestPrimaryInclusiveContinuation deletes exactly the last physical anchor
+// between two reads, as an external administrator can. Continuation must stay
+// inclusive so the next surviving document is never dropped, while the anchor
+// that is still present must be discarded exactly once.
+func TestPrimaryInclusiveContinuation(t *testing.T) {
+	const maxPage = 2
+	cases := []struct {
+		name         string
+		descending   bool
+		deleteAnchor bool
+		want         []string
+	}{
+		{
+			name:         "ascending-anchor-deleted",
+			deleteAnchor: true,
+			want:         []string{"a-1", "a-2", "a-3", "a-4"},
+		},
+		{
+			name:         "descending-anchor-deleted",
+			descending:   true,
+			deleteAnchor: true,
+			want:         []string{"a-4", "a-3", "a-2", "a-1"},
+		},
+		{
+			name: "ascending-present-anchor",
+			want: []string{"a-1", "a-2", "a-3", "a-4"},
+		},
+		{
+			name:       "descending-present-anchor",
+			descending: true,
+			want:       []string{"a-4", "a-3", "a-2", "a-1"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newFakePrimary(
+				primaryRow("a-1", nil),
+				primaryRow("a-2", nil),
+				primaryRow("a-3", nil),
+				primaryRow("a-4", nil),
+			)
+			db := newTestDB(t, fixture.handler(t), func(cfg *Config) { cfg.MaxRowsPerPage = maxPage })
+			builder := appQuery().Limit(4)
+			if tc.descending {
+				builder = builder.OrderBy(dal.DescendingField("_id"))
+			}
+			query := builder.SelectColumns(dal.Column{Expression: dal.Field("name")})
+			reader, err := db.ExecuteQueryToRecordsReader(context.Background(), query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = reader.Close() }()
+
+			ids := make([]string, 0, len(tc.want))
+			for i := 0; i < 2; i++ {
+				id, data := nextPrimary(t, reader)
+				ids = append(ids, id)
+				if !reflect.DeepEqual(data, map[string]any{"name": "name-" + id}) {
+					t.Fatalf("record %q projection = %#v", id, data)
+				}
+			}
+			if tc.deleteAnchor {
+				// The second record is the last physical row of the first
+				// page, so it is the inclusive continuation anchor.
+				fixture.delete(ids[1])
+			}
+			for i := 2; i < len(tc.want); i++ {
+				id, data := nextPrimary(t, reader)
+				ids = append(ids, id)
+				if !reflect.DeepEqual(data, map[string]any{"name": "name-" + id}) {
+					t.Fatalf("record %q projection = %#v", id, data)
+				}
+			}
+			if !reflect.DeepEqual(ids, tc.want) {
+				t.Fatalf("ids = %v; want %v", ids, tc.want)
+			}
+			seen := map[string]bool{}
+			for _, id := range ids {
+				if seen[id] {
+					t.Fatalf("document %q returned twice", id)
+				}
+				seen[id] = true
+			}
+			for _, limit := range primaryRequestLimits(t, fixture) {
+				if limit > maxPage {
+					t.Fatalf("request limit = %d; hard page cap is %d", limit, maxPage)
+				}
+			}
+		})
+	}
+}
+
+func TestPrimaryInclusiveContinuationManagementAndDeletedAnchors(t *testing.T) {
+	ctx := context.Background()
+	newReader := func(t *testing.T, fixture *fakePrimary) dal.RecordsReader {
+		t.Helper()
+		db := newTestDB(t, fixture.handler(t), func(cfg *Config) { cfg.MaxRowsPerPage = 2 })
+		reader, err := db.ExecuteQueryToRecordsReader(ctx,
+			appQuery().Limit(3).SelectColumns(dal.Column{Expression: dal.Field("name")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = reader.Close() })
+		return reader
+	}
+	nativeRows := func() []map[string]any {
+		return []map[string]any{
+			primaryRow("A-1", nil),
+			primaryRow("_design/mid", map[string]any{"views": map[string]any{}}),
+			primaryRow("b-2", nil),
+			primaryDeletedRow("gone"),
+			primaryRow("z-3", nil),
+		}
+	}
+
+	t.Run("present-management-anchor", func(t *testing.T) {
+		fixture := newFakePrimary(nativeRows()...)
+		reader := newReader(t, fixture)
+		first, _ := nextPrimary(t, reader)
+		if first != "A-1" {
+			t.Fatalf("first = %q", first)
+		}
+		if ids := readPrimaryIDs(t, reader); !reflect.DeepEqual(ids, []string{"b-2", "z-3"}) {
+			t.Fatalf("remaining ids = %v", ids)
+		}
+	})
+
+	t.Run("management-anchor-deleted", func(t *testing.T) {
+		fixture := newFakePrimary(nativeRows()...)
+		reader := newReader(t, fixture)
+		first, _ := nextPrimary(t, reader)
+		if first != "A-1" {
+			t.Fatalf("first = %q", first)
+		}
+		fixture.delete("_design/mid")
+		if ids := readPrimaryIDs(t, reader); !reflect.DeepEqual(ids, []string{"b-2", "z-3"}) {
+			t.Fatalf("remaining ids = %v", ids)
+		}
+	})
+
+	t.Run("deleted-row-anchor-disappears", func(t *testing.T) {
+		fixture := newFakePrimary(
+			primaryRow("A-1", nil),
+			primaryDeletedRow("gone"),
+			primaryRow("b-2", nil),
+		)
+		db := newTestDB(t, fixture.handler(t), func(cfg *Config) { cfg.MaxRowsPerPage = 2 })
+		reader, err := db.ExecuteQueryToRecordsReader(ctx,
+			appQuery().Limit(2).SelectColumns(dal.Column{Expression: dal.Field("name")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		first, _ := nextPrimary(t, reader)
+		if first != "A-1" {
+			t.Fatalf("first = %q", first)
+		}
+		fixture.delete("gone")
+		second, _ := nextPrimary(t, reader)
+		if second != "b-2" {
+			t.Fatalf("second = %q; the surviving row after a deleted anchor was lost", second)
+		}
+	})
+}
+
+func TestPrimaryPageCapOne(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("existing-anchor-refuses-explicitly", func(t *testing.T) {
+		fixture := newFakePrimary(primaryRow("a-1", nil), primaryRow("a-2", nil))
+		db := newTestDB(t, fixture.handler(t), func(cfg *Config) { cfg.MaxRowsPerPage = 1 })
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(2).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		if id, _ := nextPrimary(t, reader); id != "a-1" {
+			t.Fatalf("first = %q", id)
+		}
+		if _, err = reader.Next(); !errors.Is(err, dal.ErrNotSupported) {
+			t.Fatalf("error = %v; a page cap of one cannot advance past a present anchor", err)
+		}
+		if _, err = reader.Next(); !errors.Is(err, dal.ErrNotSupported) {
+			t.Fatalf("terminal error = %v; want a stable explicit refusal", err)
+		}
+	})
+
+	t.Run("deleted-anchor-still-advances", func(t *testing.T) {
+		fixture := newFakePrimary(primaryRow("a-1", nil), primaryRow("a-2", nil))
+		db := newTestDB(t, fixture.handler(t), func(cfg *Config) { cfg.MaxRowsPerPage = 1 })
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(2).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		if id, _ := nextPrimary(t, reader); id != "a-1" {
+			t.Fatalf("first = %q", id)
+		}
+		fixture.delete("a-1")
+		if id, _ := nextPrimary(t, reader); id != "a-2" {
+			t.Fatalf("second = %q; a cap of one must still keep the next surviving row", id)
+		}
+	})
+
+	t.Run("single-row-completes", func(t *testing.T) {
+		fixture := newFakePrimary(primaryRow("a-1", nil))
+		db := newTestDB(t, fixture.handler(t), func(cfg *Config) { cfg.MaxRowsPerPage = 1 })
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(1).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		if id, _ := nextPrimary(t, reader); id != "a-1" {
+			t.Fatalf("first = %q", id)
+		}
+		if _, err = reader.Next(); !errors.Is(err, dal.ErrNoMoreRecords) {
+			t.Fatalf("error = %v; want EOF after the requested row", err)
+		}
+	})
+}
+
+func TestPrimaryContinuationBudgets(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("lookahead-fits-hard-page-cap", func(t *testing.T) {
+		fixture := newFakePrimary(
+			primaryRow("a-1", nil),
+			primaryRow("a-2", nil),
+			primaryRow("a-3", nil),
+			primaryRow("a-4", nil),
+			primaryRow("a-5", nil),
+			primaryRow("a-6", nil),
+		)
+		db := newTestDB(t, fixture.handler(t), func(cfg *Config) { cfg.MaxRowsPerPage = 3 })
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Offset(1).Limit(4).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		if ids := readPrimaryIDs(t, reader); !reflect.DeepEqual(ids, []string{"a-2", "a-3", "a-4", "a-5"}) {
+			t.Fatalf("ids = %v; logical offset must survive inclusive continuation", ids)
+		}
+		limits := primaryRequestLimits(t, fixture)
+		for _, limit := range limits {
+			if limit > 3 {
+				t.Fatalf("request limit = %d; hard page cap is 3", limit)
+			}
+		}
+		if len(limits) < 2 || limits[1] != 3 {
+			t.Fatalf("limits = %v; a one-row lookahead must fit the hard cap of 3", limits)
+		}
+	})
+
+	t.Run("page-cap-refuses-mid-continuation", func(t *testing.T) {
+		fixture := newFakePrimary(
+			primaryRow("a-1", nil),
+			primaryRow("a-2", nil),
+			primaryRow("a-3", nil),
+			primaryRow("a-4", nil),
+		)
+		db := newTestDB(t, fixture.handler(t), func(cfg *Config) {
+			cfg.MaxRowsPerPage = 2
+			cfg.MaxPages = 2
+		})
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(4).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		nextPrimary(t, reader)
+		nextPrimary(t, reader)
+		nextPrimary(t, reader)
+		if _, err = reader.Next(); !errors.Is(err, ErrTooManyPages) {
+			t.Fatalf("error = %v; want an explicit page-budget refusal, never EOF", err)
+		}
+		queries, _, _ := fixture.snapshot()
+		if len(queries) != 2 {
+			t.Fatalf("physical pages = %d; want 2", len(queries))
+		}
+	})
+
+	t.Run("byte-budget-includes-continuation-anchor-and-lookahead", func(t *testing.T) {
+		text := strings.Repeat("x", 500)
+		fixture := newFakePrimary(
+			primaryRow("a-1", map[string]any{"text": text}),
+			primaryRow("a-2", map[string]any{"text": text}),
+			primaryRow("a-3", map[string]any{"text": text}),
+		)
+		db := newTestDB(t, fixture.handler(t), func(cfg *Config) {
+			cfg.MaxRowsPerPage = 2
+			cfg.MaxTotalBytes = 1500
+		})
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(3).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		for i := 0; i < 2; i++ {
+			if _, err = reader.Next(); err != nil {
+				t.Fatalf("record %d: %v", i, err)
+			}
+		}
+		if _, err = reader.Next(); !errors.Is(err, ErrResponseTooLarge) {
+			t.Fatalf("error = %v; want the continuation page charged against the byte budget", err)
+		}
+		queries, _, _ := fixture.snapshot()
+		if len(queries) != 2 {
+			t.Fatalf("physical pages = %d; want 2", len(queries))
+		}
+	})
+}
+
 func TestPrimaryProjectionsAndRecordsets(t *testing.T) {
 	fixture := newFakePrimary(
 		primaryRow("doc-1", map[string]any{"score": 10}),
@@ -537,7 +910,7 @@ func TestPrimaryHostileResponses(t *testing.T) {
 		})
 	}
 
-	t.Run("non-advancing-continuation-rejected", func(t *testing.T) {
+	t.Run("anchor-only-page-at-page-cap-one-refused", func(t *testing.T) {
 		var calls atomic.Int64
 		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			calls.Add(1)
@@ -552,8 +925,14 @@ func TestPrimaryHostileResponses(t *testing.T) {
 		if _, err = reader.Next(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err = reader.Next(); !errors.Is(err, ErrMalformedResponse) {
-			t.Fatalf("error = %v; want ErrMalformedResponse", err)
+		// The second page only repeats the inclusive anchor. With a hard page
+		// cap of one there is no room to advance, so the reader must refuse
+		// explicitly instead of reporting a false EOF or looping silently.
+		if _, err = reader.Next(); !errors.Is(err, dal.ErrNotSupported) {
+			t.Fatalf("error = %v; want explicit not-supported refusal", err)
+		}
+		if _, err = reader.Next(); !errors.Is(err, dal.ErrNotSupported) {
+			t.Fatalf("terminal error = %v; want stable refusal", err)
 		}
 		if calls.Load() != 2 {
 			t.Fatalf("calls = %d", calls.Load())
@@ -753,20 +1132,19 @@ func TestPrimaryBounds(t *testing.T) {
 	})
 
 	t.Run("operation-deadline-spans-pages", func(t *testing.T) {
-		fixture := newFakePrimary(
-			primaryRow("doc-1", nil),
-			primaryRow("doc-2", nil),
-			primaryRow("doc-3", nil),
-		)
-		slow := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			select {
-			case <-time.After(30 * time.Millisecond):
-			case <-r.Context().Done():
+		var calls atomic.Int64
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if calls.Add(1) == 1 {
+				writeJSON(w, http.StatusOK, allDocsPage(map[string]any{"_id": "doc-1", "_rev": "1-a"}))
+				return
 			}
-			fixture.handler(t).ServeHTTP(w, r)
+			// The second physical page hangs; it must be cancelled by the one
+			// operation deadline that started before the first page.
+			<-r.Context().Done()
 		})
-		db := newTestDB(t, slow, func(cfg *Config) {
+		db := newTestDB(t, handler, func(cfg *Config) {
 			cfg.MaxRowsPerPage = 1
+			cfg.MaxPages = 5
 			cfg.Timeout = 50 * time.Millisecond
 		})
 		reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(3).SelectIntoRecord(nil))

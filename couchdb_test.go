@@ -1069,3 +1069,499 @@ func TestLogicalCollectionAlias(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func fakeJSONResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode:    status,
+		Status:        fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+}
+
+func newTransportDB(t *testing.T, transport http.RoundTripper, mutate ...func(*Config)) dal.DB {
+	t.Helper()
+	cfg := Config{
+		DatabaseURL: "https://example.com/appdb",
+		HTTPClient:  &http.Client{Transport: transport},
+	}
+	for _, apply := range mutate {
+		apply(&cfg)
+	}
+	db, err := NewDB(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	t.Cleanup(func() {
+		if closer, ok := dal.As[io.Closer](db); ok {
+			_ = closer.Close()
+		}
+	})
+	return db
+}
+
+// TestGetMultiSharesOperationByteBudget proves that individually valid
+// documents cannot collectively exceed MaxTotalBytes: the cap belongs to the
+// whole GetMulti operation, not to each document request.
+func TestGetMultiSharesOperationByteBudget(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		id := strings.TrimPrefix(r.URL.Path, "/appdb/")
+		writeJSON(w, http.StatusOK, map[string]any{
+			"_id":     id,
+			"_rev":    "1-a",
+			"payload": strings.Repeat("x", 100),
+		})
+	})
+	db := newTestDB(t, handler, func(cfg *Config) { cfg.MaxTotalBytes = 200 })
+	records := []record.Record{
+		record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-1"), &map[string]any{}),
+		record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-2"), &map[string]any{}),
+		record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-3"), &map[string]any{}),
+	}
+	err := db.GetMulti(context.Background(), records)
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("error = %v", err)
+	}
+	mu.Lock()
+	gotPaths := append([]string(nil), paths...)
+	mu.Unlock()
+	if !reflect.DeepEqual(gotPaths, []string{"/appdb/doc-1", "/appdb/doc-2"}) {
+		t.Fatalf("requests = %v", gotPaths)
+	}
+	if data := *records[0].Data().(*map[string]any); data["payload"] != strings.Repeat("x", 100) {
+		t.Fatalf("first record was not populated before the budget stopped the batch: %#v", data)
+	}
+	for i := 1; i < len(records); i++ {
+		if data := *records[i].Data().(*map[string]any); len(data) != 0 {
+			t.Fatalf("record %d was populated after the failed item: %#v", i, data)
+		}
+	}
+}
+
+// TestGetMultiUsesOneOperationDeadline proves the batch does not restart the
+// per-request timeout for every document: all requests derive from one
+// operation deadline.
+func TestGetMultiUsesOneOperationDeadline(t *testing.T) {
+	var mu sync.Mutex
+	var deadlines []time.Time
+	var calls int
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		if deadline, ok := req.Context().Deadline(); ok {
+			deadlines = append(deadlines, deadline)
+		}
+		mu.Unlock()
+		// A per-item timeout would move the next deadline by at least this
+		// delay; a shared operation deadline stays fixed.
+		time.Sleep(5 * time.Millisecond)
+		id := strings.TrimPrefix(req.URL.Path, "/appdb/")
+		return fakeJSONResponse(http.StatusOK, fmt.Sprintf(`{"_id":%q,"_rev":"1-a"}`, id)), nil
+	})
+	db := newTransportDB(t, transport, func(cfg *Config) { cfg.Timeout = 2 * time.Second })
+	ctx := context.Background()
+	start := time.Now()
+	if err := db.GetMulti(ctx, []record.Record{
+		record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-1"), &map[string]any{}),
+		record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-2"), &map[string]any{}),
+		record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-3"), &map[string]any{}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 3 || len(deadlines) != 3 {
+		t.Fatalf("calls=%d deadlines=%d", calls, len(deadlines))
+	}
+	for i, deadline := range deadlines {
+		if !deadline.Equal(deadlines[0]) {
+			t.Fatalf("request %d restarted the timeout: deadlines=%v", i, deadlines)
+		}
+	}
+	if deadlines[0].Before(start) || deadlines[0].After(start.Add(2*time.Second+time.Second)) {
+		t.Fatalf("operation deadline %v is not near start+Timeout (%v)", deadlines[0], start)
+	}
+}
+
+// TestGetMultiCallerCancellationStopsLaterRequests proves cancellation ends the
+// batch after the in-flight document rather than issuing more requests.
+func TestGetMultiCallerCancellationStopsLaterRequests(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls int
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			cancel()
+		}
+		id := strings.TrimPrefix(req.URL.Path, "/appdb/")
+		return fakeJSONResponse(http.StatusOK, fmt.Sprintf(`{"_id":%q,"_rev":"1-a"}`, id)), nil
+	})
+	db := newTransportDB(t, transport)
+	records := []record.Record{
+		record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-1"), &map[string]any{}),
+		record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-2"), &map[string]any{}),
+		record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-3"), &map[string]any{}),
+	}
+	err := db.GetMulti(ctx, records)
+	if !errors.Is(err, ErrCanceled) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("requests after cancellation = %d", calls)
+	}
+	if data := *records[0].Data().(*map[string]any); data["_rev"] != "1-a" {
+		t.Fatalf("first record = %#v", data)
+	}
+	if data := *records[1].Data().(*map[string]any); len(data) != 0 {
+		t.Fatalf("second record was fetched after cancellation: %#v", data)
+	}
+}
+
+// TestGetMultiPartialFailureSemantics proves the batch stops at the failing
+// item, preserves completed items in order, and identifies the failed index.
+func TestGetMultiPartialFailureSemantics(t *testing.T) {
+	t.Run("malformed", func(t *testing.T) {
+		var paths []string
+		transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			paths = append(paths, req.URL.Path)
+			switch req.URL.Path {
+			case "/appdb/doc-1":
+				return fakeJSONResponse(http.StatusOK, `{"_id":"doc-1","_rev":"1-a","n":1}`), nil
+			case "/appdb/doc-2":
+				return fakeJSONResponse(http.StatusOK, `{"_id":"doc-2"}`), nil
+			default:
+				t.Errorf("unexpected request %s", req.URL.Path)
+				return fakeJSONResponse(http.StatusNotFound, `{"error":"not_found"}`), nil
+			}
+		})
+		db := newTransportDB(t, transport)
+		records := []record.Record{
+			record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-1"), &map[string]any{}),
+			record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-2"), &map[string]any{}),
+			record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-3"), &map[string]any{}),
+		}
+		err := db.GetMulti(context.Background(), records)
+		if !errors.Is(err, ErrMalformedResponse) {
+			t.Fatalf("error = %v", err)
+		}
+		var batchErr *GetMultiError
+		if !errors.As(err, &batchErr) || batchErr.Index != 1 {
+			t.Fatalf("error = %v, want GetMultiError.Index 1", err)
+		}
+		if !reflect.DeepEqual(paths, []string{"/appdb/doc-1", "/appdb/doc-2"}) {
+			t.Fatalf("requests = %v", paths)
+		}
+		if data := *records[0].Data().(*map[string]any); data["n"] != int64(1) {
+			t.Fatalf("first record = %#v", data)
+		}
+		for i := 1; i < len(records); i++ {
+			if data := *records[i].Data().(*map[string]any); len(data) != 0 {
+				t.Fatalf("record %d = %#v, want untouched", i, data)
+			}
+		}
+	})
+	t.Run("not-found", func(t *testing.T) {
+		var calls int
+		transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			calls++
+			switch req.URL.Path {
+			case "/appdb/doc-1":
+				return fakeJSONResponse(http.StatusOK, `{"_id":"doc-1","_rev":"1-a"}`), nil
+			case "/appdb/doc-2":
+				return fakeJSONResponse(http.StatusNotFound, `{"error":"not_found"}`), nil
+			default:
+				t.Errorf("unexpected request %s", req.URL.Path)
+				return fakeJSONResponse(http.StatusNotFound, `{"error":"not_found"}`), nil
+			}
+		})
+		db := newTransportDB(t, transport)
+		records := []record.Record{
+			record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-1"), &map[string]any{}),
+			record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-2"), &map[string]any{}),
+			record.NewRecordWithData(record.NewKeyWithID("appdb", "doc-3"), &map[string]any{}),
+		}
+		err := db.GetMulti(context.Background(), records)
+		if !errors.Is(err, record.ErrRecordNotFound) {
+			t.Fatalf("error = %v", err)
+		}
+		var batchErr *GetMultiError
+		if !errors.As(err, &batchErr) || batchErr.Index != 1 {
+			t.Fatalf("error = %v, want GetMultiError.Index 1", err)
+		}
+		if calls != 2 {
+			t.Fatalf("requests = %d", calls)
+		}
+	})
+}
+
+func columnNames(rs recordset.Recordset) []string {
+	names := make([]string, rs.ColumnsCount())
+	for i := range names {
+		names[i] = rs.GetColumnByIndex(i).Name()
+	}
+	return names
+}
+
+func projectionHandler(t *testing.T, docs []map[string]any) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/appdb/_find" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		body := readRequestBody(t, r)
+		fields, _ := body["fields"].([]any)
+		seen := map[string]bool{}
+		for _, raw := range fields {
+			name, ok := raw.(string)
+			if !ok {
+				t.Errorf("requested field is not a string: %#v", raw)
+				continue
+			}
+			if seen[name] {
+				t.Errorf("duplicate requested field %q", name)
+			}
+			seen[name] = true
+		}
+		result := make([]any, 0, len(docs))
+		for _, doc := range docs {
+			if len(fields) == 0 {
+				result = append(result, doc)
+				continue
+			}
+			projected := make(map[string]any, len(fields))
+			for name := range seen {
+				if value, ok := doc[name]; ok {
+					projected[name] = value
+				}
+			}
+			result = append(result, projected)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"docs": result})
+	})
+}
+
+// TestProjectionKeepsRequestedIDColumn proves an explicit _id projection keeps
+// its output column and is materialized from the native record key rather than
+// silently disappearing.
+func TestProjectionKeepsRequestedIDColumn(t *testing.T) {
+	docs := []map[string]any{
+		{"_id": "doc-1", "_rev": "1-a", "name": "tea", "score": 10},
+		{"_id": "doc-2", "_rev": "1-b", "name": "coffee", "score": 20},
+	}
+	db := newTestDB(t, projectionHandler(t, docs))
+	ctx := context.Background()
+
+	t.Run("id-only-recordset", func(t *testing.T) {
+		reader, err := db.ExecuteQueryToRecordsetReader(ctx, appQuery().Limit(2).
+			SelectColumns(dal.Column{Expression: dal.Field("_id")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs := reader.Recordset()
+		if names := columnNames(rs); !reflect.DeepEqual(names, []string{"_id", "_rev"}) {
+			t.Fatalf("columns = %v", names)
+		}
+		if rs.GetColumnByName("name") != nil {
+			t.Fatal("unrequested column was fabricated")
+		}
+		row, _, err := reader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := row.GetValueByName("_id", rs)
+		if err != nil || id != "doc-1" {
+			t.Fatalf("_id = %#v err=%v", id, err)
+		}
+		rev, err := row.GetValueByName("_rev", rs)
+		if err != nil || rev != "1-a" {
+			t.Fatalf("_rev = %#v err=%v", rev, err)
+		}
+	})
+
+	t.Run("id-only-records", func(t *testing.T) {
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(2).
+			SelectColumns(dal.Column{Expression: dal.Field("_id")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := reader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Key().ID != "doc-1" {
+			t.Fatalf("key ID = %v", rec.Key().ID)
+		}
+		if data := dataOf(t, rec); len(data) != 1 || data["_rev"] != "1-a" {
+			t.Fatalf("data = %#v", data)
+		}
+	})
+
+	t.Run("mixed-order-preserved", func(t *testing.T) {
+		reader, err := db.ExecuteQueryToRecordsetReader(ctx, appQuery().Limit(2).
+			SelectColumns(
+				dal.Column{Expression: dal.Field("name")},
+				dal.Column{Expression: dal.Field("_id")},
+			))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs := reader.Recordset()
+		if names := columnNames(rs); !reflect.DeepEqual(names, []string{"name", "_id", "_rev"}) {
+			t.Fatalf("columns = %v", names)
+		}
+		row, _, err := reader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		name, _ := row.GetValueByName("name", rs)
+		id, _ := row.GetValueByName("_id", rs)
+		if name != "tea" || id != "doc-1" {
+			t.Fatalf("name=%#v _id=%#v", name, id)
+		}
+	})
+
+	t.Run("wildcard-recordset", func(t *testing.T) {
+		reader, err := db.ExecuteQueryToRecordsetReader(ctx, appQuery().Limit(2).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs := reader.Recordset()
+		if names := columnNames(rs); !reflect.DeepEqual(names, []string{"_rev", "name", "score"}) {
+			t.Fatalf("columns = %v", names)
+		}
+		if rs.GetColumnByName("_id") != nil {
+			t.Fatal("wildcard recordset fabricated an _id column instead of using the record key")
+		}
+	})
+
+	t.Run("wildcard-records", func(t *testing.T) {
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(2).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := reader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Key().ID != "doc-1" {
+			t.Fatalf("key ID = %v", rec.Key().ID)
+		}
+		data := dataOf(t, rec)
+		if data["name"] != "tea" || data["_rev"] != "1-a" {
+			t.Fatalf("data = %#v", data)
+		}
+	})
+}
+
+func readAllRecords(reader dal.RecordsReader) error {
+	for {
+		if _, err := reader.Next(); err != nil {
+			return err
+		}
+	}
+}
+
+// TestFindResponseRequiresDocsArray proves an HTTP 200 Mango body is only a
+// success when it explicitly carries a non-null docs array.
+func TestFindResponseRequiresDocsArray(t *testing.T) {
+	malformed := []string{`{}`, `null`, `{"docs":null}`, `{"docs":"nope"}`, `{"docs":{}}`, `{"bookmark":"b1"}`}
+	for _, payload := range malformed {
+		t.Run("malformed="+payload, func(t *testing.T) {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(payload))
+			})
+			db := newTestDB(t, handler)
+			reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = readAllRecords(reader); !errors.Is(err, ErrMalformedResponse) {
+				t.Fatalf("records reader error = %v", err)
+			}
+			if _, err = db.ExecuteQueryToRecordsetReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil)); !errors.Is(err, ErrMalformedResponse) {
+				t.Fatalf("recordset reader error = %v", err)
+			}
+			pager, ok := dal.As[MangoPager](db)
+			if !ok {
+				t.Fatal("MangoPager not reachable")
+			}
+			if _, err = pager.ReadMangoPage(context.Background(), MangoPageRequest{Query: appQuery().Limit(1).SelectIntoRecord(nil)}); !errors.Is(err, ErrMalformedResponse) {
+				t.Fatalf("pager error = %v", err)
+			}
+		})
+	}
+
+	t.Run("empty-docs-accepted", func(t *testing.T) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, map[string]any{"docs": []any{}})
+		})
+		db := newTestDB(t, handler)
+		reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = readAllRecords(reader); !errors.Is(err, dal.ErrNoMoreRecords) {
+			t.Fatalf("records error = %v", err)
+		}
+		result, err := db.ExecuteQueryToRecordsetReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rs := result.Recordset(); rs.RowsCount() != 0 {
+			t.Fatalf("rows = %d", rs.RowsCount())
+		}
+	})
+}
+
+// TestIndexCatalogRequiresIndexesArray proves a missing or non-array index
+// catalog is a malformed response, never an empty catalog.
+func TestIndexCatalogRequiresIndexesArray(t *testing.T) {
+	malformed := []string{`{}`, `null`, `{"indexes":null}`, `{"indexes":{}}`, `{"indexes":"nope"}`}
+	for _, payload := range malformed {
+		t.Run("malformed="+payload, func(t *testing.T) {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(payload))
+			})
+			db := newTestDB(t, handler)
+			sr, _ := dal.As[dbschema.SchemaReader](db)
+			ref := dal.NewRootCollectionRef("appdb", "")
+			indexes, err := sr.ListIndexes(context.Background(), &ref)
+			if !errors.Is(err, ErrMalformedResponse) || indexes != nil {
+				t.Fatalf("indexes=%v err=%v", indexes, err)
+			}
+		})
+	}
+
+	t.Run("empty-catalog-accepted", func(t *testing.T) {
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, map[string]any{"total_rows": 0, "indexes": []any{}})
+		})
+		db := newTestDB(t, handler)
+		sr, _ := dal.As[dbschema.SchemaReader](db)
+		ref := dal.NewRootCollectionRef("appdb", "")
+		indexes, err := sr.ListIndexes(context.Background(), &ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if indexes == nil || len(indexes) != 0 {
+			t.Fatalf("indexes = %#v", indexes)
+		}
+	})
+}

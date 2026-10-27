@@ -95,7 +95,12 @@ data := *rec.Data().(*map[string]any) // native fields plus _rev
 ```
 
 `Exists` uses `HEAD` and does not download the document. `GetMulti` is bounded
-by `MaxGetMany`; every key is validated before the first request.
+by `MaxGetMany`; every key is validated before the first request. The whole
+batch is one operation: all documents share one deadline, one `MaxTotalBytes`
+response budget and one result order, so N documents cannot restart the limits
+or retain N response bodies. A failure returns `*GetMultiError` with the index
+of the first unread item; earlier records stay populated, later records are
+untouched and are not requested.
 
 Writes are not implemented. The adapter does not satisfy `dal.WriteSession`, and
 `RunReadwriteTransaction` returns an error wrapping `dal.ErrNotSupported` without
@@ -149,8 +154,10 @@ for {
 ```
 
 `ExecuteQueryToRecordsetReader` materializes the same bounded result into a
-`recordset.Recordset`. A projected query keeps its declared columns (plus `_rev`);
-an unprojected query uses the sorted union of returned native fields.
+`recordset.Recordset`. A projected query keeps its declared columns in order
+(plus `_rev`); an explicitly requested `_id` column is materialized from the
+native record key rather than dropped. An unprojected query uses the sorted
+union of returned native fields and leaves identity on the record key.
 `recordset.WithName` overrides the recordset name.
 
 ### Mango indexes and sorting
@@ -216,13 +223,16 @@ negative or above-maximum values are rejected.
 | `MaxGetMany` | 100 | 1000 | keys in one `GetMulti` |
 | `MaxRequestBytes` | 1 MiB | 64 MiB | JSON request body |
 | `MaxResponseBytes` | 4 MiB | 64 MiB | one HTTP response body |
-| `MaxTotalBytes` | 16 MiB | 64 MiB | response bytes and retained row bytes (each bounded by this cap) per operation |
+| `MaxTotalBytes` | 16 MiB | 64 MiB | response bytes and retained row bytes (each bounded by this cap) per operation; `GetMulti` is one operation |
 | `MaxRowBytes` | 1 MiB | 64 MiB | one decoded document |
-| `Timeout` | 30s | 2m | one HTTP request |
+| `Timeout` | 30s | 2m | one HTTP request; `GetMulti` uses one deadline for the whole batch |
 
 Response byte limits are checked before JSON decoding; row and cardinality
 limits are checked before a record is returned. Exceeding a budget stops the
-operation; results are never silently truncated.
+operation; results are never silently truncated. An HTTP 200 Mango body must
+contain an explicit non-null `docs` array, and `_index` must contain an explicit
+non-null `indexes` array; `{}`, `null` and wrong shapes are errors, while
+`docs: []` and `indexes: []` are legitimate empty results.
 
 Cancellation and deadlines propagate through the request context. The adapter
 returns safe errors that preserve `errors.Is(err, context.Canceled)` and
@@ -234,8 +244,9 @@ Use `errors.Is` with `dal.ErrNotSupported`, `record.ErrRecordNotFound`, and the
 adapter's exported sentinels (`ErrIndexRequired`, `ErrContinuationMismatch`,
 `ErrResponseTooLarge`, `ErrRowTooLarge`, `ErrTooManyRows`, `ErrTooManyPages`,
 `ErrMalformedResponse`, `ErrUnsafeValue`, `ErrHeaderProvider`,
-`ErrRequestFailed`, `ErrDatabaseNotFound`). `*HTTPError` carries only a status
-code. Errors never include URLs, credentials, headers, request bodies or
+`ErrRequestFailed`, `ErrDatabaseNotFound`). `*GetMultiError` identifies the
+failed batch index and unwraps to these errors. `*HTTPError` carries only a
+status code. Errors never include URLs, credentials, headers, request bodies or
 response bodies.
 
 ## Real local CouchDB tests

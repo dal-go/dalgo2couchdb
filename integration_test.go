@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -146,6 +147,91 @@ func TestRealCouchDB(t *testing.T) {
 			t.Fatalf("scores = %v", scores)
 		}
 		dalgotest.AssertUniqueKeys(t, records)
+	})
+
+	t.Run("projection-keeps-id", func(t *testing.T) {
+		idQuery := func() dal.Query {
+			return dal.From(dal.NewRootCollectionRef(dbName, "")).NewQuery().
+				WhereField("status", dal.Equal, "active").
+				WhereField("score", dal.GreaterOrEqual, 0).
+				OrderBy(dal.DescendingField("score")).
+				Limit(2).
+				SelectColumns(dal.Column{Expression: dal.Field("_id")})
+		}
+		recordsReader, err := db.ExecuteQueryToRecordsReader(ctx, idQuery())
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := recordsReader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Key().ID != "doc-1" {
+			t.Fatalf("key ID = %v", rec.Key().ID)
+		}
+		if data := dataOf(t, rec); len(data) != 1 || data["_rev"] == nil {
+			t.Fatalf("id-only record data = %#v", data)
+		}
+		_ = recordsReader.Close()
+
+		reader, err := db.ExecuteQueryToRecordsetReader(ctx, idQuery())
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs := reader.Recordset()
+		names := columnNames(rs)
+		if !reflect.DeepEqual(names, []string{"_id", "_rev"}) {
+			t.Fatalf("id-only columns = %v", names)
+		}
+		row := rs.GetRow(0)
+		id, err := row.GetValueByName("_id", rs)
+		if err != nil || id != "doc-1" {
+			t.Fatalf("_id = %#v err=%v", id, err)
+		}
+
+		mixedQuery := dal.From(dal.NewRootCollectionRef(dbName, "")).NewQuery().
+			WhereField("status", dal.Equal, "active").
+			WhereField("score", dal.GreaterOrEqual, 0).
+			OrderBy(dal.DescendingField("score")).
+			Limit(2).
+			SelectColumns(
+				dal.Column{Expression: dal.Field("_id")},
+				dal.Column{Expression: dal.Field("name")},
+			)
+		mixed, err := db.ExecuteQueryToRecordsetReader(ctx, mixedQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mixedRS := mixed.Recordset()
+		if names = columnNames(mixedRS); !reflect.DeepEqual(names, []string{"_id", "name", "_rev"}) {
+			t.Fatalf("mixed columns = %v", names)
+		}
+		mixedRow := mixedRS.GetRow(0)
+		if id, _ = mixedRow.GetValueByName("_id", mixedRS); id != "doc-1" {
+			t.Fatalf("mixed _id = %#v", id)
+		}
+		if name, _ := mixedRow.GetValueByName("name", mixedRS); name != "alpha" {
+			t.Fatalf("mixed name = %#v", name)
+		}
+
+		wildcard, err := db.ExecuteQueryToRecordsetReader(ctx, dal.From(dal.NewRootCollectionRef(dbName, "")).NewQuery().
+			WhereField("status", dal.Equal, "active").
+			WhereField("score", dal.GreaterOrEqual, 0).
+			OrderBy(dal.DescendingField("score")).
+			Limit(2).
+			SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		wildcardRS := wildcard.Recordset()
+		if wildcardRS.GetColumnByName("_id") != nil {
+			t.Fatal("wildcard recordset fabricated an _id column instead of using the record key")
+		}
+		for _, required := range []string{"_rev", "name", "score"} {
+			if wildcardRS.GetColumnByName(required) == nil {
+				t.Fatalf("wildcard columns %v lost %q", columnNames(wildcardRS), required)
+			}
+		}
 	})
 
 	t.Run("recordset", func(t *testing.T) {

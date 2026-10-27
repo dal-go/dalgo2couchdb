@@ -396,25 +396,41 @@ func (d *database) Get(ctx context.Context, rec record.Record) error {
 	if err := d.validateRecordKey(rec); err != nil {
 		return err
 	}
+	var totalBytes int64
+	_, err := d.getDocument(ctx, rec, &totalBytes)
+	return err
+}
+
+// getDocument reads one document and, when totalBytes is non-nil, charges the
+// raw response against the operation's running byte budget before decoding.
+// totalBytes belongs to the whole operation, not to one document.
+func (d *database) getDocument(ctx context.Context, rec record.Record, totalBytes *int64) (int64, error) {
 	key := rec.Key()
 	status, payload, err := d.request(ctx, http.MethodGet, "/"+url.PathEscape(key.ID.(string)), nil, http.StatusOK, http.StatusNotFound)
 	if err != nil {
-		return err
+		return 0, err
+	}
+	size := int64(len(payload))
+	if totalBytes != nil {
+		if *totalBytes > d.cfg.MaxTotalBytes-size {
+			return 0, ErrResponseTooLarge
+		}
+		*totalBytes += size
 	}
 	if status == http.StatusNotFound {
 		err = dal.NewErrNotFoundByKey(key, nil)
 		rec.SetError(err)
-		return err
+		return size, err
 	}
 	data, err := d.documentData(payload, key.ID.(string))
 	if err != nil {
-		return err
+		return size, err
 	}
 	if err = assignData(rec.Data(), data); err != nil {
-		return err
+		return size, err
 	}
 	rec.SetError(nil)
-	return nil
+	return size, nil
 }
 
 func assignData(target any, data map[string]any) error {
@@ -446,8 +462,16 @@ func (d *database) Exists(ctx context.Context, key *record.Key) (bool, error) {
 }
 
 // GetMulti reads a bounded batch. All keys are validated before the first
-// request, so a malformed key or an oversized batch performs no I/O.
+// request, so a malformed key or an oversized batch performs no I/O. The whole
+// batch shares one deadline, one response-byte budget and one cardinality
+// bound: completing N documents is one operation and cannot restart those
+// limits for every request. Records are read in caller order. On failure the
+// returned *GetMultiError names the first unread item; earlier records stay
+// populated and later records are left untouched and unrequested.
 func (d *database) GetMulti(ctx context.Context, records []record.Record) error {
+	if ctx == nil {
+		return errors.New("couchdb: context is required")
+	}
 	if len(records) > d.cfg.MaxGetMany {
 		return notSupported("GetMulti exceeds MaxGetMany")
 	}
@@ -456,9 +480,15 @@ func (d *database) GetMulti(ctx context.Context, records []record.Record) error 
 			return err
 		}
 	}
-	for _, rec := range records {
-		if err := d.Get(ctx, rec); err != nil {
-			return err
+	batchCtx, cancel := context.WithTimeout(ctx, d.cfg.Timeout)
+	defer cancel()
+	var totalBytes int64
+	for index, rec := range records {
+		if err := batchCtx.Err(); err != nil {
+			return &GetMultiError{Index: index, Err: safeContextError(batchCtx, err)}
+		}
+		if _, err := d.getDocument(batchCtx, rec, &totalBytes); err != nil {
+			return &GetMultiError{Index: index, Err: err}
 		}
 	}
 	return nil

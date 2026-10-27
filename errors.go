@@ -61,6 +61,29 @@ var (
 	ErrDatabaseNotFound = errors.New("couchdb: database not found")
 )
 
+// GetMultiError reports which item of a GetMulti batch stopped the batch.
+// Records before Index are populated; the record at Index and all later
+// records are not. It unwraps to the underlying cause, so errors.Is and
+// errors.As keep working for sentinels and record.ErrRecordNotFound.
+type GetMultiError struct {
+	Index int
+	Err   error
+}
+
+func (e *GetMultiError) Error() string {
+	if e == nil || e.Err == nil {
+		return "couchdb: get multi failed"
+	}
+	return fmt.Sprintf("couchdb: get multi item %d: %v", e.Index, e.Err)
+}
+
+func (e *GetMultiError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 // HTTPError is a safe CouchDB HTTP status error. Only the status code is kept;
 // response headers and bodies are discarded.
 type HTTPError struct {

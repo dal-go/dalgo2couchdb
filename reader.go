@@ -165,7 +165,11 @@ func (d *database) ExecuteQueryToRecordsetReader(ctx context.Context, query dal.
 		rowData := rec.Data().(map[string]any)
 		row := result.NewRow()
 		for _, column := range columns {
-			if err = row.SetValueByName(column, rowData[column], result); err != nil {
+			value := rowData[column]
+			if column == "_id" {
+				value = rec.Key().ID
+			}
+			if err = row.SetValueByName(column, value, result); err != nil {
 				return nil, err
 			}
 		}
@@ -175,11 +179,20 @@ func (d *database) ExecuteQueryToRecordsetReader(ctx context.Context, query dal.
 
 func recordsetColumns(records []record.Record, p plan) []string {
 	if p.hasProjection {
-		columns := make([]string, 0, len(p.fields))
-		for _, field := range p.fields {
-			if field != "_id" {
-				columns = append(columns, field)
+		// Keep exactly the caller's declared columns, in order, plus _rev
+		// metadata. _id is a real declared column here; it is materialized
+		// from the record key because native CouchDB documents carry identity
+		// as _id rather than as duplicate row data.
+		columns := make([]string, 0, len(p.columns)+1)
+		hasRev := false
+		for _, field := range p.columns {
+			columns = append(columns, field)
+			if field == "_rev" {
+				hasRev = true
 			}
+		}
+		if !hasRev {
+			columns = append(columns, "_rev")
 		}
 		return columns
 	}

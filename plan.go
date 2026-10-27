@@ -1,6 +1,7 @@
 package dalgo2couchdb
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -20,6 +21,7 @@ import (
 // reach CouchDB.
 type plan struct {
 	selector      map[string]any
+	columns       []string
 	fields        []string
 	sort          []map[string]string
 	limit         int
@@ -43,9 +45,49 @@ type findRequest struct {
 }
 
 type findResponse struct {
-	Docs     []map[string]any `json:"docs"`
-	Bookmark string           `json:"bookmark"`
-	Warning  string           `json:"warning"`
+	Docs     []map[string]any
+	Bookmark string
+	Warning  string
+}
+
+// decodeRequiredArray accepts only an explicitly present JSON array. An absent
+// or null field, an object, a scalar or a nil slice is a malformed response,
+// never an empty success. An explicit [] is a legitimate empty array.
+func decodeRequiredArray[T any](raw json.RawMessage, what string) ([]T, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, malformed(what + " is missing a JSON array")
+	}
+	if trimmed[0] != '[' {
+		return nil, malformed(what + " is not a JSON array")
+	}
+	var values []T
+	if err := decodeJSON(trimmed, &values); err != nil {
+		return nil, err
+	}
+	if values == nil {
+		return nil, malformed(what + " is not a JSON array")
+	}
+	return values, nil
+}
+
+// decodeFindResponse decodes a Mango find body. CouchDB must return an explicit
+// non-null docs array; {}, null and {"docs":null} are errors rather than empty
+// successful results.
+func decodeFindResponse(payload []byte) (findResponse, error) {
+	var wire struct {
+		Docs     json.RawMessage `json:"docs"`
+		Bookmark string          `json:"bookmark"`
+		Warning  string          `json:"warning"`
+	}
+	if err := decodeJSON(payload, &wire); err != nil {
+		return findResponse{}, err
+	}
+	docs, err := decodeRequiredArray[map[string]any](wire.Docs, "find response docs")
+	if err != nil {
+		return findResponse{}, err
+	}
+	return findResponse{Docs: docs, Bookmark: wire.Bookmark, Warning: wire.Warning}, nil
 }
 
 func (d *database) makePlan(query dal.Query) (plan, error) {
@@ -124,10 +166,14 @@ func (d *database) makePlan(query dal.Query) (plan, error) {
 			return plan{}, notSupported("couchdb duplicate projection fields are not supported")
 		}
 		seenColumns[name] = true
-		p.fields = append(p.fields, name)
+		p.columns = append(p.columns, name)
 	}
-	if len(p.fields) > 0 {
+	if len(p.columns) > 0 {
 		p.hasProjection = true
+		// columns is the caller's declared output, in order. fields is the
+		// wider Mango projection: it adds the native identity and _rev
+		// metadata needed to build records even when they were not declared.
+		p.fields = append(p.fields, p.columns...)
 		if !seenColumns["_id"] {
 			p.fields = append([]string{"_id"}, p.fields...)
 		}
@@ -432,7 +478,7 @@ func (d *database) fetchMangoPage(ctx context.Context, p plan, pageSize, skip in
 		*totalBytes += int64(len(payload))
 	}
 	var response findResponse
-	if err = decodeJSON(payload, &response); err != nil {
+	if response, err = decodeFindResponse(payload); err != nil {
 		return nil, "", false, err
 	}
 	if len(response.Docs) > pageSize {

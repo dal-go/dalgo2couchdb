@@ -2,6 +2,7 @@ package dalgo2couchdb
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"github.com/dal-go/dalgo/dal"
@@ -14,6 +15,14 @@ import (
 // collection and real Mango indexes. It never infers a declared field schema
 // from a sampled document.
 var _ dbschema.SchemaReader = (*database)(nil)
+
+type indexCatalogEntry struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+	Def  struct {
+		Fields []map[string]string `json:"fields"`
+	} `json:"def"`
+}
 
 // ListCollections returns the one configured logical collection. CouchDB
 // application documents live directly in a database, so there is no broader
@@ -63,23 +72,23 @@ func (d *database) ListIndexes(ctx context.Context, ref *dal.CollectionRef) ([]d
 		return nil, ErrResponseTooLarge
 	}
 	totalBytes = int64(len(payload))
-	var response struct {
-		Indexes []struct {
-			Name string `json:"name"`
-			Type string `json:"type"`
-			Def  struct {
-				Fields []map[string]string `json:"fields"`
-			} `json:"def"`
-		} `json:"indexes"`
+	var wire struct {
+		Indexes json.RawMessage `json:"indexes"`
 	}
-	if err = decodeJSON(payload, &response); err != nil {
+	if err = decodeJSON(payload, &wire); err != nil {
+		return nil, err
+	}
+	// CouchDB must return an explicit non-null indexes array. A missing field,
+	// null, an object or a scalar is a malformed catalog, never "no indexes".
+	entries, err := decodeRequiredArray[indexCatalogEntry](wire.Indexes, "index catalog")
+	if err != nil {
 		return nil, err
 	}
 	if totalBytes > d.cfg.MaxTotalBytes {
 		return nil, ErrResponseTooLarge
 	}
-	indexes := make([]dbschema.IndexDef, 0, len(response.Indexes))
-	for _, index := range response.Indexes {
+	indexes := make([]dbschema.IndexDef, 0, len(entries))
+	for _, index := range entries {
 		if index.Name == "" || len(index.Name) > 256 {
 			return nil, malformed("index name is missing or too long")
 		}

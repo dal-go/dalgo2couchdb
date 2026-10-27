@@ -12,7 +12,9 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,12 +32,22 @@ func TestRealCouchDB(t *testing.T) {
 	base, dbName, adminAuth, readerUser, readerAuth, readerPassword := integrationConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		status, _, err := integrationRequest(cleanupCtx, http.MethodDelete, base+"/"+dbName, adminAuth, "", nil)
+		if err != nil || (status != http.StatusOK && status != http.StatusNotFound && status != http.StatusAccepted) {
+			t.Logf("cleanup drop database: status=%d err=%v", status, err)
+		}
+	})
 
 	dropDatabase(t, ctx, base, dbName, adminAuth)
 	createDatabase(t, ctx, base, dbName, adminAuth)
 	ensureReaderUser(t, ctx, base, adminAuth, readerUser, readerPassword)
 	grantMemberAccess(t, ctx, base, dbName, adminAuth, readerUser)
 	seed := []map[string]any{
+		{"_id": "_design/aaa", "views": map[string]any{}},
+		{"_id": "_design/zzz", "views": map[string]any{}},
 		{"_id": "doc-1", "kind": "product", "status": "active", "name": "alpha", "score": 50, "price": 1.5, "active": true, "note": nil, "nullable": nil},
 		{"_id": "doc-2", "kind": "product", "status": "active", "name": "bravo", "score": 40, "price": 2.5, "active": false, "note": "n2", "nullable": "n2"},
 		{"_id": "doc-3", "kind": "product", "status": "active", "name": "charlie", "score": 30, "price": 3.5, "active": true, "note": nil, "nullable": nil},
@@ -44,17 +56,26 @@ func TestRealCouchDB(t *testing.T) {
 		{"_id": "doc-6", "kind": "product", "status": "active", "name": "foxtrot", "score": 5, "price": 6.5, "active": true, "note": nil},
 		{"_id": "doc-7", "kind": "product", "status": "archived", "name": "golf", "score": 60, "price": 7.5, "active": true, "note": nil, "nullable": "n7"},
 		{"_id": "native/slash", "kind": "other", "status": "other", "name": "slash", "score": 1, "price": 0.5, "active": false, "note": nil},
+		{"_id": "a..b", "kind": "other", "status": "other", "name": "a..b", "score": 2, "active": false},
+		{"_id": `back\slash`, "kind": "other", "status": "other", "name": `back\slash`, "score": 3, "active": false},
+		{"_id": `quote"id`, "kind": "other", "status": "other", "name": `quote"id`, "score": 4, "active": false},
+		{"_id": "Ünïcode", "kind": "other", "status": "other", "name": "Ünïcode", "score": 5, "active": false},
+		{"_id": "doc-deleted", "kind": "other", "status": "other", "name": "deleted", "score": 6, "active": false},
 	}
 	bulkDocs(t, ctx, base, dbName, adminAuth, seed)
 	createIndex(t, ctx, base, dbName, adminAuth, "score-index", []string{"score"})
 	createIndex(t, ctx, base, dbName, adminAuth, "status-score-index", []string{"status", "score"})
 	createIndex(t, ctx, base, dbName, adminAuth, "nullable-index", []string{"nullable"})
 	createIndex(t, ctx, base, dbName, adminAuth, "status-nullable-index", []string{"status", "nullable"})
+	deleteDocument(t, ctx, base, dbName, adminAuth, "doc-deleted")
 
+	recorder := newRecordingTransport()
 	cfg := Config{
 		DatabaseURL:       base + "/" + dbName,
 		AllowLoopbackHTTP: true,
 		MaxRowsPerPage:    2,
+		MaxPages:          100,
+		HTTPClient:        &http.Client{Transport: recorder},
 		Headers: func(context.Context) (map[string]string, error) {
 			return map[string]string{"Authorization": readerAuth}, nil
 		},
@@ -117,6 +138,7 @@ func TestRealCouchDB(t *testing.T) {
 	}
 
 	t.Run("bounded-mango-pages", func(t *testing.T) {
+		recorder.reset()
 		reader, err := db.ExecuteQueryToRecordsReader(ctx, query())
 		if err != nil {
 			t.Fatal(err)
@@ -149,6 +171,15 @@ func TestRealCouchDB(t *testing.T) {
 			t.Fatalf("scores = %v", scores)
 		}
 		dalgotest.AssertUniqueKeys(t, records)
+		requests := recorder.snapshot()
+		if len(requests) < 2 {
+			t.Fatalf("indexed Mango pages = %d; want several bookmark pages", len(requests))
+		}
+		for _, request := range requests {
+			if request.method != http.MethodPost || request.path != "/"+dbName+"/_find" {
+				t.Fatalf("indexed query request = %s %s; want POST _find", request.method, request.path)
+			}
+		}
 	})
 
 	t.Run("projection-keeps-id", func(t *testing.T) {
@@ -464,6 +495,171 @@ func TestRealCouchDB(t *testing.T) {
 		dalgotest.AssertUniqueKeys(t, all)
 	})
 
+	t.Run("native-primary-enumeration", func(t *testing.T) {
+		ref := dal.NewRootCollectionRef(dbName, "")
+		schemaReader, ok := dal.As[dbschema.SchemaReader](db)
+		if !ok {
+			t.Fatal("SchemaReader not reachable")
+		}
+		indexes, err := schemaReader.ListIndexes(ctx, &ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, index := range indexes {
+			for _, field := range index.Fields {
+				if field == "_id" && index.Name != "_all_docs" {
+					t.Fatalf("fixture must not have a JSON _id index, found %q", index.Name)
+				}
+			}
+		}
+		if !contains(indexNames(indexes), "_all_docs") {
+			t.Fatalf("native primary index was not reported: %v", indexNames(indexes))
+		}
+
+		allIDs := []string{"a..b", `back\slash`, "doc-1", "doc-2", "doc-3", "doc-4", "doc-5", "doc-6", "doc-7", "native/slash", `quote"id`, "Ünïcode"}
+
+		recorder.reset()
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, dal.From(ref).NewQuery().
+			OrderBy(dal.Ascending(dal.DocumentID())).Limit(5).
+			SelectColumns(dal.Column{Expression: dal.Field("_id")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := integrationReadIDs(t, reader)
+		_ = reader.Close()
+		if want := allIDs[:5]; !reflect.DeepEqual(ids, want) {
+			t.Fatalf("first bounded primary page ids = %v; want %v", ids, want)
+		}
+		requests := recorder.snapshot()
+		if len(requests) < 3 {
+			t.Fatalf("physical primary pages = %d; want several including management pages", len(requests))
+		}
+		for _, request := range requests {
+			if request.method == http.MethodPost || request.path == "/"+dbName+"/_find" {
+				t.Fatalf("unfiltered read used Mango: %s %s", request.method, request.path)
+			}
+		}
+
+		// Offset is logical: management documents and the deleted document
+		// never consume it.
+		recorder.reset()
+		reader, err = db.ExecuteQueryToRecordsReader(ctx, dal.From(ref).NewQuery().Offset(2).Limit(3).
+			SelectColumns(dal.Column{Expression: dal.Field("_id")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = integrationReadIDs(t, reader)
+		_ = reader.Close()
+		if want := allIDs[2:5]; !reflect.DeepEqual(ids, want) {
+			t.Fatalf("offset primary ids = %v; want %v", ids, want)
+		}
+		for _, request := range recorder.snapshot() {
+			if request.path != "/"+dbName+"/_all_docs" {
+				t.Fatalf("offset primary request = %s %s", request.method, request.path)
+			}
+		}
+
+		// A single _id order is native, in both directions.
+		recorder.reset()
+		reader, err = db.ExecuteQueryToRecordsReader(ctx, dal.From(ref).NewQuery().
+			OrderBy(dal.DescendingField("_id")).Limit(3).
+			SelectColumns(dal.Column{Expression: dal.Field("_id")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = integrationReadIDs(t, reader)
+		_ = reader.Close()
+		if want := []string{"Ünïcode", `quote"id`, "native/slash"}; !reflect.DeepEqual(ids, want) {
+			t.Fatalf("descending primary ids = %v; want %v", ids, want)
+		}
+		for _, request := range recorder.snapshot() {
+			if request.query.Get("descending") != "true" {
+				t.Fatalf("descending request = %v", request.query)
+			}
+		}
+
+		// Exact projections and metadata remain correct on the primary path.
+		recorder.reset()
+		reader, err = db.ExecuteQueryToRecordsReader(ctx, dal.From(ref).NewQuery().Limit(1).
+			SelectColumns(
+				dal.Column{Expression: dal.Field("_rev")},
+				dal.Column{Expression: dal.Field("name")},
+			))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := reader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = reader.Close()
+		data := dataOf(t, rec)
+		if rev, ok := data["_rev"].(string); !ok || rev == "" {
+			t.Fatalf("_rev metadata = %#v", data["_rev"])
+		}
+		if data["name"] != "a..b" || len(data) != 2 {
+			t.Fatalf("explicit projection data = %#v", data)
+		}
+
+		idOnly := dal.From(ref).NewQuery().Limit(1).SelectColumns(dal.Column{Expression: dal.Field("_id")})
+		reader, err = db.ExecuteQueryToRecordsReader(ctx, idOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err = reader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = reader.Close()
+		if rec.Key().ID != "a..b" || len(dataOf(t, rec)) != 0 {
+			t.Fatalf("id-only primary record = %v %#v", rec.Key().ID, dataOf(t, rec))
+		}
+
+		recordsetReader, err := db.ExecuteQueryToRecordsetReader(ctx, idOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs := recordsetReader.Recordset()
+		if names := columnNames(rs); !reflect.DeepEqual(names, []string{"_id"}) {
+			t.Fatalf("id-only primary columns = %v", names)
+		}
+		if id, err := rs.GetRow(0).GetValueByName("_id", rs); err != nil || id != "a..b" {
+			t.Fatalf("primary recordset _id = %#v err=%v", id, err)
+		}
+
+		// Full enumeration proves management docs and the deleted document are
+		// excluded and application IDs are stable and unique across pages.
+		recorder.reset()
+		reader, err = db.ExecuteQueryToRecordsReader(ctx, dal.From(ref).NewQuery().Limit(20).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = reader.Close() }()
+		var records []record.Record
+		var enumerated []string
+		for {
+			rec, err := reader.Next()
+			if errors.Is(err, dal.ErrNoMoreRecords) {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			records = append(records, rec)
+			enumerated = append(enumerated, rec.Key().ID.(string))
+		}
+		if !reflect.DeepEqual(enumerated, allIDs) {
+			t.Fatalf("full primary ids = %v; want %v", enumerated, allIDs)
+		}
+		dalgotest.AssertUniqueKeys(t, records)
+		if contains(enumerated, "doc-deleted") {
+			t.Fatal("deleted document was exposed")
+		}
+		if pages := len(recorder.snapshot()); pages < 5 {
+			t.Fatalf("full enumeration physical pages = %d; want several", pages)
+		}
+	})
+
 	t.Run("schema-and-indexes", func(t *testing.T) {
 		sr, ok := dal.As[dbschema.SchemaReader](db)
 		if !ok {
@@ -500,6 +696,7 @@ func TestRealCouchDB(t *testing.T) {
 			OrderBy(dal.AscendingField("name")).
 			Limit(2).
 			SelectIntoRecord(nil)
+		recorder.reset()
 		reader, err := db.ExecuteQueryToRecordsReader(ctx, q)
 		if err != nil {
 			if !errors.Is(err, ErrIndexRequired) {
@@ -510,6 +707,10 @@ func TestRealCouchDB(t *testing.T) {
 		defer func() { _ = reader.Close() }()
 		if _, err = reader.Next(); !errors.Is(err, ErrIndexRequired) {
 			t.Fatalf("error = %v", err)
+		}
+		requests := recorder.snapshot()
+		if len(requests) != 1 || requests[0].path != "/"+dbName+"/_find" {
+			t.Fatalf("missing-index requests = %+v; want one Mango request and no primary scan", requests)
 		}
 	})
 
@@ -557,6 +758,10 @@ func integrationConfig(t *testing.T) (base, dbName, adminAuth, readerUser, reade
 	if !strings.HasPrefix(dbName, "datatug_couchdb_test") {
 		t.Fatalf("refusing to use non-disposable database %q", dbName)
 	}
+	// Every run owns a uniquely named database so concurrent runs on one
+	// disposable server cannot share fixtures. The configured name stays the
+	// required disposable prefix.
+	dbName += "_run_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	base = u.Scheme + "://" + u.Host
 	if status, _, err := integrationRequest(context.Background(), http.MethodGet, base+"/_up", "", "", nil); err != nil || status != http.StatusOK {
 		t.Fatalf("CouchDB _up check failed: status=%d err=%v", status, err)
@@ -722,4 +927,101 @@ func contains(values []string, wanted string) bool {
 		}
 	}
 	return false
+}
+
+func indexNames(indexes []dbschema.IndexDef) []string {
+	names := make([]string, len(indexes))
+	for i, index := range indexes {
+		names[i] = index.Name
+	}
+	return names
+}
+
+func deleteDocument(t *testing.T, ctx context.Context, base, dbName, auth, id string) {
+	t.Helper()
+	status, body, err := integrationRequest(ctx, http.MethodGet, base+"/"+dbName+"/"+url.PathEscape(id), auth, "", nil)
+	if err != nil {
+		t.Fatalf("read %q before delete: %v", id, err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("read %q before delete: status=%d body=%s", id, status, body)
+	}
+	var doc map[string]any
+	if err = json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("decode %q before delete: %v", id, err)
+	}
+	rev, _ := doc["_rev"].(string)
+	if rev == "" {
+		t.Fatalf("document %q has no revision", id)
+	}
+	status, body, err = integrationRequest(ctx, http.MethodDelete,
+		base+"/"+dbName+"/"+url.PathEscape(id)+"?rev="+url.QueryEscape(rev), auth, "", nil)
+	if err != nil {
+		t.Fatalf("delete %q: %v", id, err)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("delete %q: status=%d body=%s", id, status, body)
+	}
+}
+
+func integrationReadIDs(t *testing.T, reader dal.RecordsReader) []string {
+	t.Helper()
+	var ids []string
+	for {
+		rec, err := reader.Next()
+		if errors.Is(err, dal.ErrNoMoreRecords) {
+			return ids
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		id, ok := rec.Key().ID.(string)
+		if !ok {
+			t.Fatalf("key ID is %T, want string", rec.Key().ID)
+		}
+		ids = append(ids, id)
+	}
+}
+
+type recordedRequest struct {
+	method string
+	path   string
+	query  url.Values
+}
+
+// recordingTransport observes the adapter's real HTTP requests without
+// changing them, so tests can prove which execution path was used.
+type recordingTransport struct {
+	base     http.RoundTripper
+	mu       sync.Mutex
+	requests []recordedRequest
+}
+
+func newRecordingTransport() *recordingTransport {
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.Proxy = nil
+	return &recordingTransport{base: base}
+}
+
+func (t *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	t.requests = append(t.requests, recordedRequest{
+		method: req.Method,
+		path:   req.URL.Path,
+		query:  req.URL.Query(),
+	})
+	t.mu.Unlock()
+	return t.base.RoundTrip(req)
+}
+
+func (t *recordingTransport) reset() {
+	t.mu.Lock()
+	t.requests = nil
+	t.mu.Unlock()
+}
+
+func (t *recordingTransport) snapshot() []recordedRequest {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]recordedRequest(nil), t.requests...)
 }

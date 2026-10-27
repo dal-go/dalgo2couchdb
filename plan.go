@@ -16,11 +16,22 @@ import (
 	"github.com/dal-go/record"
 )
 
-// plan is the bounded, validated Mango request shape. It is constructed before
-// any network request so unsupported, malformed and over-budget queries cannot
+// plan is the bounded, validated request shape. It is constructed before any
+// network request so unsupported, malformed and over-budget queries cannot
 // reach CouchDB.
+//
+// A plan is executed in exactly one of two modes. Filtered queries always use
+// the Mango _find endpoint with allow_fallback:false. A query with no filter
+// and no ordering, or a single _id ordering, is an explicit primary-index
+// enumeration served by bounded _all_docs pages; that is the only case in which
+// the native primary index is used and it never bypasses a filter.
 type plan struct {
 	selector map[string]any
+	// primary reports that this plan enumerates the native _all_docs primary
+	// index rather than issuing a Mango _find request.
+	primary bool
+	// descending requests native descending _id order from _all_docs.
+	descending bool
 	// columns is the caller's declared output projection, in declaration
 	// order. It is the exact set of fields exposed in record data and
 	// recordset columns; _id stays on the record key.
@@ -218,6 +229,23 @@ func (d *database) makePlan(query dal.Query) (plan, error) {
 		p.sort = append(p.sort, map[string]string{name: current})
 	}
 
+	// An unfiltered collection read has no Mango index to use for an empty
+	// selector. It is served deliberately by native primary-index enumeration
+	// when the ordering is absent or is a single _id order. Any filter, or an
+	// order on another field, keeps the existing Mango path: a predicate that
+	// cannot use Mango is never turned into a primary scan.
+	if q.Where() == nil {
+		switch {
+		case len(p.sort) == 0:
+			p.primary = true
+		case len(p.sort) == 1:
+			if sortDirection, isID := p.sort[0]["_id"]; isID {
+				p.primary = true
+				p.descending = sortDirection == "desc"
+			}
+		}
+	}
+
 	p.identity = d.identity(p)
 	return p, nil
 }
@@ -327,11 +355,11 @@ func condition(value dal.Condition, depth int, budget *int) (map[string]any, err
 		// dal.IsNullCondition counts an absent field as NULL in every
 		// executor. Mango condition operators only match a field that exists,
 		// and a JSON index never contains documents that lack the indexed
-		// field, so absent fields can only be matched with the _all_docs
-		// primary scan. This adapter forbids that scan (allow_fallback is
-		// always false), so IS NULL cannot be served with the exact contract
-		// semantics and is refused before any request rather than silently
-		// matching explicit nulls only.
+		// field, so absent fields can only be matched by a primary scan. A
+		// filtered query is Mango-only and never uses the native primary
+		// enumeration (which needs an unfiltered query), so IS NULL cannot be
+		// served with the exact contract semantics and is refused before any
+		// request rather than silently matching explicit nulls only.
 		if !c.Negated() {
 			return nil, notSupported("couchdb IS NULL cannot match absent fields through a Mango index")
 		}
@@ -415,11 +443,22 @@ func normalizeArray(value any) ([]any, error) {
 	return values, nil
 }
 
+func (p plan) mode() string {
+	if !p.primary {
+		return "mango"
+	}
+	if p.descending {
+		return "primary-desc"
+	}
+	return "primary-asc"
+}
+
 func (d *database) identity(p plan) string {
 	identity := struct {
 		Version    int                 `json:"v"`
 		Endpoint   string              `json:"endpoint"`
 		Collection string              `json:"collection"`
+		Mode       string              `json:"mode"`
 		Selector   map[string]any      `json:"selector"`
 		Fields     []string            `json:"fields,omitempty"`
 		Sort       []map[string]string `json:"sort,omitempty"`
@@ -427,6 +466,7 @@ func (d *database) identity(p plan) string {
 		Version:    1,
 		Endpoint:   d.baseURL,
 		Collection: d.collection,
+		Mode:       p.mode(),
 		Selector:   p.selector,
 		Fields:     p.fields,
 		Sort:       p.sort,
@@ -535,6 +575,12 @@ func (d *database) ReadMangoPage(ctx context.Context, request MangoPageRequest) 
 	p, err := d.makePlan(request.Query)
 	if err != nil {
 		return MangoPage{}, err
+	}
+	if p.primary {
+		// Primary-index enumeration has no Mango bookmark. Refusing it here is
+		// explicit: its native identity continuation must never be encoded as
+		// a Mango bookmark, and no public pager mode is added for it.
+		return MangoPage{}, notSupported("couchdb primary-index enumeration is not available through MangoPager; use ExecuteQueryToRecordsReader")
 	}
 	if p.limit > d.cfg.MaxRowsPerPage {
 		return MangoPage{}, notSupported("couchdb page limit exceeds MaxRowsPerPage")

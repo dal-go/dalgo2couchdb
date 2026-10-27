@@ -11,9 +11,11 @@ import (
 )
 
 // ExecuteQueryToRecordsReader returns a lazily paged reader over native
-// application documents. Each Mango page is bounded and bookmarked; the
-// reader never fetches more rows than the query limit or the configured page,
-// byte and page budgets allow.
+// application documents. Filtered queries are served by bounded Mango pages;
+// an unfiltered query with no order or a single _id order is served by bounded
+// native _all_docs primary-index pages. Either reader never fetches more rows
+// than the query limit or the configured page, byte, row and page budgets
+// allow.
 func (d *database) ExecuteQueryToRecordsReader(ctx context.Context, query dal.Query) (dal.RecordsReader, error) {
 	if ctx == nil {
 		return nil, errors.New("couchdb: context is required")
@@ -21,6 +23,12 @@ func (d *database) ExecuteQueryToRecordsReader(ctx context.Context, query dal.Qu
 	p, err := d.makePlan(query)
 	if err != nil {
 		return nil, err
+	}
+	if p.primary {
+		// One operation deadline spans every physical primary-index page,
+		// including pages that only carried management documents.
+		opCtx, cancel := context.WithTimeout(ctx, d.cfg.Timeout)
+		return &primaryReader{ctx: opCtx, cancel: cancel, db: d, plan: p, skip: p.offset}, nil
 	}
 	return &recordsReader{ctx: ctx, db: d, plan: p, skip: p.offset}, nil
 }

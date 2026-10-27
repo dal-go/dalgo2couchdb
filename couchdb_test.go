@@ -53,6 +53,32 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// allDocsRow builds one native _all_docs row (include_docs=true) from a
+// document. It is test-only fixture construction, not adapter behavior.
+func allDocsRow(doc map[string]any) map[string]any {
+	id, _ := doc["_id"].(string)
+	rev, _ := doc["_rev"].(string)
+	return map[string]any{
+		"id":    id,
+		"key":   id,
+		"value": map[string]any{"rev": rev},
+		"doc":   doc,
+	}
+}
+
+// allDocsPage builds a native _all_docs response body for the given documents.
+func allDocsPage(docs ...map[string]any) map[string]any {
+	rows := make([]any, len(docs))
+	for i, doc := range docs {
+		rows[i] = allDocsRow(doc)
+	}
+	return map[string]any{
+		"total_rows": len(docs),
+		"offset":     0,
+		"rows":       rows,
+	}
+}
+
 func readRequestBody(t *testing.T, r *http.Request) map[string]any {
 	t.Helper()
 	decoder := json.NewDecoder(r.Body)
@@ -144,7 +170,10 @@ func TestConfigValidation(t *testing.T) {
 			t.Fatalf("config error leaked a secret: %v", err)
 		}
 	}
-	if _, err := NewDB(nil, valid[0]); err == nil {
+	// NewDB must reject a nil context. Keep the typed nil so the check is
+	// still a real nil-interface proof without an untyped nil argument.
+	var nilContext context.Context
+	if _, err := NewDB(nilContext, valid[0]); err == nil {
 		t.Fatal("nil context accepted")
 	}
 }
@@ -245,7 +274,7 @@ func TestUnprojectedNativeTypes(t *testing.T) {
 		}}})
 	})
 	db := newTestDB(t, handler)
-	reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+	reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().WhereField("status", dal.Equal, "active").Limit(1).SelectIntoRecord(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +436,7 @@ func TestIndexErrorCodesMapToErrIndexRequired(t *testing.T) {
 			})
 			db := newTestDB(t, handler)
 			reader, err := db.ExecuteQueryToRecordsReader(context.Background(),
-				appQuery().Limit(1).SelectIntoRecord(nil))
+				appQuery().WhereField("status", dal.Equal, "active").Limit(1).SelectIntoRecord(nil))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -457,7 +486,7 @@ func TestBookmarkedPages(t *testing.T) {
 		cfg.MaxRowsPerPage = 2
 		cfg.MaxPages = 3
 	})
-	reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(5).SelectIntoRecord(nil))
+	reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().WhereField("status", dal.Equal, "active").Limit(5).SelectIntoRecord(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +653,7 @@ func TestRowAndCardinalityCapsBeforeReturningRows(t *testing.T) {
 			}})
 		})
 		db := newTestDB(t, handler, func(cfg *Config) { cfg.MaxRowBytes = 32 })
-		reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+		reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().WhereField("status", dal.Equal, "active").Limit(1).SelectIntoRecord(nil))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -640,7 +669,7 @@ func TestRowAndCardinalityCapsBeforeReturningRows(t *testing.T) {
 			}})
 		})
 		db := newTestDB(t, handler, func(cfg *Config) { cfg.MaxRowsPerPage = 1 })
-		reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+		reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().WhereField("status", dal.Equal, "active").Limit(1).SelectIntoRecord(nil))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -715,7 +744,7 @@ func TestCancellationThroughInFlightRequestAndReader(t *testing.T) {
 		db := newTestDB(t, handler, func(cfg *Config) { cfg.MaxRowsPerPage = 1 })
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(2).SelectIntoRecord(nil))
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().WhereField("status", dal.Equal, "active").Limit(2).SelectIntoRecord(nil))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -979,7 +1008,7 @@ func TestMalformedResponses(t *testing.T) {
 				_, _ = w.Write([]byte(tc.payload))
 			})
 			db := newTestDB(t, handler)
-			reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+			reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().WhereField("status", dal.Equal, "active").Limit(1).SelectIntoRecord(nil))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1173,10 +1202,19 @@ func TestMangoPagerContinuationBinding(t *testing.T) {
 
 func TestRecordsetReaders(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"docs": []any{
+		if r.Method != http.MethodGet || r.URL.Path != "/appdb/_all_docs" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Query().Get("startkey") != "" {
+			writeJSON(w, http.StatusOK, allDocsPage())
+			return
+		}
+		writeJSON(w, http.StatusOK, allDocsPage(
 			map[string]any{"_id": "doc-1", "_rev": "1-a", "name": "tea", "score": 10},
 			map[string]any{"_id": "doc-2", "_rev": "1-b", "name": "coffee", "score": 20},
-		}})
+		))
 	})
 	db := newTestDB(t, handler)
 	q := appQuery().Limit(2).SelectColumns(dal.Column{Expression: dal.Field("name")}, dal.Column{Expression: dal.Field("score")})
@@ -1207,7 +1245,7 @@ func TestRecordsetReaders(t *testing.T) {
 	}
 
 	emptyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"docs": []any{}})
+		writeJSON(w, http.StatusOK, allDocsPage())
 	})
 	emptyDB := newTestDB(t, emptyHandler)
 	emptyReader, err := emptyDB.ExecuteQueryToRecordsetReader(context.Background(), q)
@@ -1247,7 +1285,7 @@ func TestLogicalCollectionAlias(t *testing.T) {
 	if db.ID() != "orders" {
 		t.Fatalf("ID = %s", db.ID())
 	}
-	q := dal.From(dal.NewRootCollectionRef("orders", "")).NewQuery().Limit(1).SelectIntoRecord(nil)
+	q := dal.From(dal.NewRootCollectionRef("orders", "")).NewQuery().WhereField("status", dal.Equal, "active").Limit(1).SelectIntoRecord(nil)
 	reader, err := db.ExecuteQueryToRecordsReader(context.Background(), q)
 	if err != nil {
 		t.Fatal(err)
@@ -1255,7 +1293,7 @@ func TestLogicalCollectionAlias(t *testing.T) {
 	if _, err = reader.Next(); err != nil {
 		t.Fatal(err)
 	}
-	other := dal.From(dal.NewRootCollectionRef("appdb", "")).NewQuery().Limit(1).SelectIntoRecord(nil)
+	other := dal.From(dal.NewRootCollectionRef("appdb", "")).NewQuery().WhereField("status", dal.Equal, "active").Limit(1).SelectIntoRecord(nil)
 	if _, err = db.ExecuteQueryToRecordsReader(context.Background(), other); !errors.Is(err, dal.ErrNotSupported) {
 		t.Fatalf("error = %v", err)
 	}
@@ -1507,6 +1545,16 @@ func columnNames(rs recordset.Recordset) []string {
 func projectionHandler(t *testing.T, docs []map[string]any) http.Handler {
 	t.Helper()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/appdb/_all_docs" {
+			// Native primary enumeration returns whole documents; the adapter
+			// must still expose exactly the declared columns.
+			if r.URL.Query().Get("startkey") != "" {
+				writeJSON(w, http.StatusOK, allDocsPage())
+				return
+			}
+			writeJSON(w, http.StatusOK, allDocsPage(docs...))
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/appdb/_find" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -1750,21 +1798,22 @@ func TestFindResponseRequiresDocsArray(t *testing.T) {
 				_, _ = w.Write([]byte(payload))
 			})
 			db := newTestDB(t, handler)
-			reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+			mango := appQuery().WhereField("status", dal.Equal, "active")
+			reader, err := db.ExecuteQueryToRecordsReader(context.Background(), mango.Limit(1).SelectIntoRecord(nil))
 			if err != nil {
 				t.Fatal(err)
 			}
 			if err = readAllRecords(reader); !errors.Is(err, ErrMalformedResponse) {
 				t.Fatalf("records reader error = %v", err)
 			}
-			if _, err = db.ExecuteQueryToRecordsetReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil)); !errors.Is(err, ErrMalformedResponse) {
+			if _, err = db.ExecuteQueryToRecordsetReader(context.Background(), mango.Limit(1).SelectIntoRecord(nil)); !errors.Is(err, ErrMalformedResponse) {
 				t.Fatalf("recordset reader error = %v", err)
 			}
 			pager, ok := dal.As[MangoPager](db)
 			if !ok {
 				t.Fatal("MangoPager not reachable")
 			}
-			if _, err = pager.ReadMangoPage(context.Background(), MangoPageRequest{Query: appQuery().Limit(1).SelectIntoRecord(nil)}); !errors.Is(err, ErrMalformedResponse) {
+			if _, err = pager.ReadMangoPage(context.Background(), MangoPageRequest{Query: mango.Limit(1).SelectIntoRecord(nil)}); !errors.Is(err, ErrMalformedResponse) {
 				t.Fatalf("pager error = %v", err)
 			}
 		})
@@ -1775,14 +1824,15 @@ func TestFindResponseRequiresDocsArray(t *testing.T) {
 			writeJSON(w, http.StatusOK, map[string]any{"docs": []any{}})
 		})
 		db := newTestDB(t, handler)
-		reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+		mango := appQuery().WhereField("status", dal.Equal, "active")
+		reader, err := db.ExecuteQueryToRecordsReader(context.Background(), mango.Limit(1).SelectIntoRecord(nil))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err = readAllRecords(reader); !errors.Is(err, dal.ErrNoMoreRecords) {
 			t.Fatalf("records error = %v", err)
 		}
-		result, err := db.ExecuteQueryToRecordsetReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+		result, err := db.ExecuteQueryToRecordsetReader(context.Background(), mango.Limit(1).SelectIntoRecord(nil))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -3,9 +3,11 @@
 //
 // It reads application documents as they are stored: the CouchDB _id is the
 // DALgo record key and _rev is returned as document metadata. It does not
-// require or write a DALgo envelope. Structured queries are translated to a
-// bounded subset of CouchDB Mango; raw URLs, management endpoints, writes,
-// joins and aggregation are not exposed.
+// require or write a DALgo envelope. Filtered structured queries are translated
+// to a bounded subset of CouchDB Mango; an unfiltered collection read with no
+// ordering or a single _id ordering is served by bounded native _all_docs
+// primary-index enumeration. Raw URLs, management endpoints, writes, joins and
+// aggregation are not exposed.
 package dalgo2couchdb
 
 import (
@@ -65,10 +67,12 @@ type Config struct {
 
 	// MaxRows is the largest accepted structured-query limit. Default 1000.
 	MaxRows int
-	// MaxRowsPerPage bounds one Mango request. Default 100.
+	// MaxRowsPerPage bounds one Mango request or one native _all_docs page.
+	// Default 100.
 	MaxRowsPerPage int
-	// MaxPages bounds how many Mango pages one operation may request.
-	// Default 20.
+	// MaxPages bounds how many Mango or native primary-index pages one
+	// operation may request, including pages that carry only management
+	// documents. Default 20.
 	MaxPages int
 	// MaxOffset is the largest accepted query offset. Default 10000.
 	MaxOffset int
@@ -82,7 +86,8 @@ type Config struct {
 	MaxTotalBytes int64
 	// MaxRowBytes bounds one decoded document's JSON size. Default 1 MiB.
 	MaxRowBytes int64
-	// Timeout bounds one HTTP request. Default 30s.
+	// Timeout bounds one HTTP request and one native primary-index operation.
+	// Default 30s.
 	Timeout time.Duration
 }
 
@@ -614,11 +619,23 @@ func convertJSONNumbers(value any) any {
 }
 
 func (d *database) request(ctx context.Context, method, path string, body any, accepted ...int) (int, []byte, error) {
+	return d.requestQuery(ctx, method, path, nil, body, accepted...)
+}
+
+// requestQuery performs one request against a fixed adapter route with
+// adapter-built query parameters. The route itself is still validated as a
+// fixed relative path; query values are always URL-encoded from validated
+// native values, never taken from a caller.
+func (d *database) requestQuery(ctx context.Context, method, path string, query url.Values, body any, accepted ...int) (int, []byte, error) {
 	if ctx == nil {
 		return 0, nil, errors.New("couchdb: context is required")
 	}
 	if !strings.HasPrefix(path, "/") || strings.Contains(path, "..") {
 		return 0, nil, unsafeValue("request path is not a fixed relative route")
+	}
+	rawURL := d.baseURL + path
+	if len(query) > 0 {
+		rawURL += "?" + query.Encode()
 	}
 	headers, err := d.requestHeaders(ctx)
 	if err != nil {
@@ -640,7 +657,7 @@ func (d *database) request(ctx context.Context, method, path string, body any, a
 	if payload != nil {
 		reader = bytes.NewReader(payload)
 	}
-	req, err := http.NewRequestWithContext(requestCtx, method, d.baseURL+path, reader)
+	req, err := http.NewRequestWithContext(requestCtx, method, rawURL, reader)
 	if err != nil {
 		return 0, nil, ErrRequestFailed
 	}

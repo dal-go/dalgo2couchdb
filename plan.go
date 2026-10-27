@@ -20,8 +20,14 @@ import (
 // any network request so unsupported, malformed and over-budget queries cannot
 // reach CouchDB.
 type plan struct {
-	selector      map[string]any
-	columns       []string
+	selector map[string]any
+	// columns is the caller's declared output projection, in declaration
+	// order. It is the exact set of fields exposed in record data and
+	// recordset columns; _id stays on the record key.
+	columns []string
+	// fields is the wider Mango fetch projection. It always carries the
+	// native identity and _rev metadata needed to build a validated record,
+	// even when the caller did not declare them. It never widens the output.
 	fields        []string
 	sort          []map[string]string
 	limit         int
@@ -171,8 +177,9 @@ func (d *database) makePlan(query dal.Query) (plan, error) {
 	if len(p.columns) > 0 {
 		p.hasProjection = true
 		// columns is the caller's declared output, in order. fields is the
-		// wider Mango projection: it adds the native identity and _rev
-		// metadata needed to build records even when they were not declared.
+		// wider Mango fetch projection: it adds the native identity and _rev
+		// metadata needed to validate and build records even when they were
+		// not declared. recordFromDoc trims the response back to columns.
 		p.fields = append(p.fields, p.columns...)
 		if !seenColumns["_id"] {
 			p.fields = append([]string{"_id"}, p.fields...)
@@ -317,11 +324,21 @@ func condition(value dal.Condition, depth int, budget *int) (map[string]any, err
 		if err != nil {
 			return nil, err
 		}
-		operator := "$eq"
-		if c.Negated() {
-			operator = "$ne"
+		// dal.IsNullCondition counts an absent field as NULL in every
+		// executor. Mango condition operators only match a field that exists,
+		// and a JSON index never contains documents that lack the indexed
+		// field, so absent fields can only be matched with the _all_docs
+		// primary scan. This adapter forbids that scan (allow_fallback is
+		// always false), so IS NULL cannot be served with the exact contract
+		// semantics and is refused before any request rather than silently
+		// matching explicit nulls only.
+		if !c.Negated() {
+			return nil, notSupported("couchdb IS NULL cannot match absent fields through a Mango index")
 		}
-		return map[string]any{name: map[string]any{operator: nil}}, nil
+		// IS NOT NULL is the exact complement: Mango's $ne requires the field
+		// to exist, so an explicit null and an absent field are both excluded,
+		// and a JSON index on the field can serve the query.
+		return map[string]any{name: map[string]any{"$ne": nil}}, nil
 	default:
 		return nil, notSupported("couchdb condition type is not supported")
 	}
@@ -561,7 +578,10 @@ func (d *database) ReadMangoPage(ctx context.Context, request MangoPageRequest) 
 }
 
 // recordFromDoc converts one native document into a DALgo record. _id becomes
-// the key; _rev and every other projected field stay in the data map.
+// the key. A projected query exposes exactly its declared columns, in
+// declaration order; the wider fetch fields only validate identity and
+// revision. An unprojected query keeps every returned native field, including
+// _rev, as before.
 func (d *database) recordFromDoc(doc map[string]any, p plan) (record.Record, error) {
 	id, ok := doc["_id"].(string)
 	if !ok || id == "" || !utf8Safe(id, 1024) {
@@ -574,11 +594,22 @@ func (d *database) recordFromDoc(doc map[string]any, p plan) (record.Record, err
 		return nil, malformed("document revision is missing")
 	}
 	data := make(map[string]any, len(doc))
-	for key, value := range doc {
-		if key == "_id" {
-			continue
+	if p.hasProjection {
+		for _, key := range p.columns {
+			if key == "_id" {
+				continue
+			}
+			if value, present := doc[key]; present {
+				data[key] = convertJSONNumbers(value)
+			}
 		}
-		data[key] = convertJSONNumbers(value)
+	} else {
+		for key, value := range doc {
+			if key == "_id" {
+				continue
+			}
+			data[key] = convertJSONNumbers(value)
+		}
 	}
 	size, err := encodedSize(data)
 	if err != nil {

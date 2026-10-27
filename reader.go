@@ -179,22 +179,11 @@ func (d *database) ExecuteQueryToRecordsetReader(ctx context.Context, query dal.
 
 func recordsetColumns(records []record.Record, p plan) []string {
 	if p.hasProjection {
-		// Keep exactly the caller's declared columns, in order, plus _rev
-		// metadata. _id is a real declared column here; it is materialized
-		// from the record key because native CouchDB documents carry identity
-		// as _id rather than as duplicate row data.
-		columns := make([]string, 0, len(p.columns)+1)
-		hasRev := false
-		for _, field := range p.columns {
-			columns = append(columns, field)
-			if field == "_rev" {
-				hasRev = true
-			}
-		}
-		if !hasRev {
-			columns = append(columns, "_rev")
-		}
-		return columns
+		// Keep exactly the caller's declared columns, in order. _id is a real
+		// declared column here; it is materialized from the record key because
+		// native CouchDB documents carry identity as _id rather than as
+		// duplicate row data. _rev is exposed only when it was declared.
+		return append([]string(nil), p.columns...)
 	}
 	seen := map[string]bool{}
 	for _, rec := range records {

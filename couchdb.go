@@ -679,7 +679,11 @@ func (d *database) request(ctx context.Context, method, path string, body any, a
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return resp.StatusCode, respBody, &HTTPError{StatusCode: resp.StatusCode}
 	}
-	if errorCode(respBody) == "no_usable_index" {
+	if code := errorCode(respBody); code == "no_usable_index" || code == "invalid_index" {
+		// Both mean the selector cannot be served by a usable Mango index
+		// under allow_fallback:false. CouchDB reports invalid_index when no
+		// index matches at all (including $exists-only predicates), and
+		// no_usable_index when a sort/selector combination leaves none.
 		return resp.StatusCode, respBody, ErrIndexRequired
 	}
 	return resp.StatusCode, respBody, &HTTPError{StatusCode: resp.StatusCode}
@@ -721,7 +725,7 @@ func errorCode(payload []byte) string {
 		return ""
 	}
 	switch envelope.Error {
-	case "no_usable_index", "not_found", "unauthorized", "forbidden":
+	case "no_usable_index", "invalid_index", "not_found", "unauthorized", "forbidden":
 		return envelope.Error
 	default:
 		return ""

@@ -213,6 +213,54 @@ func TestTranslationAndNativeTypes(t *testing.T) {
 	if _, exists := data["_id"]; exists {
 		t.Fatal("_id leaked into data; it is the record key")
 	}
+	if !reflect.DeepEqual(data, map[string]any{"name": "tea", "score": int64(10)}) {
+		t.Fatalf("projected data = %#v; want exactly the declared columns", data)
+	}
+	if _, exists := data["_rev"]; exists {
+		t.Fatal("_rev leaked into a projection that did not declare it")
+	}
+	if _, err = reader.Next(); !errors.Is(err, dal.ErrNoMoreRecords) {
+		t.Fatalf("want no more records, got %v", err)
+	}
+}
+
+// TestUnprojectedNativeTypes proves a query without a projection still exposes
+// every returned native field, including _rev, and preserves native JSON types.
+func TestUnprojectedNativeTypes(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readRequestBody(t, r)
+		if fields, ok := body["fields"].([]any); ok && len(fields) != 0 {
+			t.Errorf("unprojected request sent fields: %v", fields)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"docs": []any{map[string]any{
+			"_id":    "doc-1",
+			"_rev":   "1-abc",
+			"name":   "tea",
+			"score":  10,
+			"active": true,
+			"note":   nil,
+			"big":    json.Number("123456789012345678901234567890"),
+			"nested": map[string]any{"n": 1},
+			"tags":   []any{"a", 2},
+		}}})
+	})
+	db := newTestDB(t, handler)
+	reader, err := db.ExecuteQueryToRecordsReader(context.Background(), appQuery().Limit(1).SelectIntoRecord(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Close() }()
+	rec, err := reader.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Key().Collection() != "appdb" || rec.Key().ID != "doc-1" {
+		t.Fatalf("identity: %s %v", rec.Key().Collection(), rec.Key().ID)
+	}
+	data := dataOf(t, rec)
+	if _, exists := data["_id"]; exists {
+		t.Fatal("_id leaked into data; it is the record key")
+	}
 	if data["_rev"] != "1-abc" {
 		t.Fatalf("_rev metadata = %#v", data["_rev"])
 	}
@@ -226,8 +274,151 @@ func TestTranslationAndNativeTypes(t *testing.T) {
 	if !ok || nested["n"] != int64(1) {
 		t.Fatalf("nested value lost: %#v", data["nested"])
 	}
-	if _, err = reader.Next(); !errors.Is(err, dal.ErrNoMoreRecords) {
-		t.Fatalf("want no more records, got %v", err)
+	if tags, ok := data["tags"].([]any); !ok || len(tags) != 2 || tags[0] != "a" || tags[1] != int64(2) {
+		t.Fatalf("array value lost: %#v", data["tags"])
+	}
+}
+
+// TestIsNullAndNativeNullComparison separates two contracts that Mango treats
+// differently: an explicit comparison with nil is a native $eq:null (an
+// explicit null only, never an absent field, per adapter-specific single-source
+// semantics), while dal.IsNullCondition counts absent fields as NULL in every
+// DALgo executor. IS NOT NULL is exactly expressible and maps to $ne:null;
+// IS NULL is refused before any request because a Mango index cannot contain
+// documents that lack the indexed field.
+func TestIsNullAndNativeNullComparison(t *testing.T) {
+	var mu sync.Mutex
+	var selectors []any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readRequestBody(t, r)
+		mu.Lock()
+		selectors = append(selectors, body["selector"])
+		mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"docs": []any{map[string]any{
+			"_id": "doc-1", "_rev": "1-a", "nullable": nil, "name": "tea",
+		}}})
+	})
+	db := newTestDB(t, handler)
+	ctx := context.Background()
+	requestCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(selectors)
+	}
+	lastSelector := func(t *testing.T) string {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		if len(selectors) == 0 {
+			t.Fatal("no request was made")
+		}
+		return canonicalJSON(t, selectors[len(selectors)-1])
+	}
+
+	t.Run("is-not-null-maps-to-ne-null", func(t *testing.T) {
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(2).
+			Where(dal.Field("nullable").IsNotNull()).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = reader.Next(); err != nil {
+			t.Fatal(err)
+		}
+		if got := lastSelector(t); got != `{"nullable":{"$ne":null}}` {
+			t.Fatalf("selector = %s", got)
+		}
+	})
+
+	t.Run("is-not-null-in-and-group", func(t *testing.T) {
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(2).
+			WhereField("kind", dal.Equal, "k").
+			Where(dal.Field("nullable").IsNotNull()).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = reader.Next(); err != nil {
+			t.Fatal(err)
+		}
+		if got := lastSelector(t); got != `{"$and":[{"kind":{"$eq":"k"}},{"nullable":{"$ne":null}}]}` {
+			t.Fatalf("selector = %s", got)
+		}
+	})
+
+	t.Run("native-nil-comparison-stays-eq-null", func(t *testing.T) {
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(2).
+			WhereField("nullable", dal.Equal, nil).SelectIntoRecord(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = reader.Next(); err != nil {
+			t.Fatal(err)
+		}
+		if got := lastSelector(t); got != `{"nullable":{"$eq":null}}` {
+			t.Fatalf("selector = %s", got)
+		}
+	})
+
+	refused := []struct {
+		name  string
+		query dal.Query
+	}{
+		{"is-null", appQuery().Limit(2).Where(dal.Field("nullable").IsNull()).SelectIntoRecord(nil)},
+		{"is-null-in-and", appQuery().Limit(2).WhereField("kind", dal.Equal, "k").
+			Where(dal.Field("nullable").IsNull()).SelectIntoRecord(nil)},
+		{"is-null-in-or", appQuery().Limit(2).
+			Where(dal.NewGroupCondition(dal.Or,
+				dal.WhereField("score", dal.GreaterOrEqual, 1),
+				dal.Field("nullable").IsNull())).SelectIntoRecord(nil)},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name+"-refused-before-io", func(t *testing.T) {
+			before := requestCount()
+			if _, err := db.ExecuteQueryToRecordsReader(ctx, tc.query); !errors.Is(err, dal.ErrNotSupported) {
+				t.Fatalf("records reader error = %v", err)
+			}
+			if _, err := db.ExecuteQueryToRecordsetReader(ctx, tc.query); !errors.Is(err, dal.ErrNotSupported) {
+				t.Fatalf("recordset reader error = %v", err)
+			}
+			pager, ok := dal.As[MangoPager](db)
+			if !ok {
+				t.Fatal("MangoPager not reachable")
+			}
+			if _, err := pager.ReadMangoPage(ctx, MangoPageRequest{Query: tc.query}); !errors.Is(err, dal.ErrNotSupported) {
+				t.Fatalf("pager error = %v", err)
+			}
+			if after := requestCount(); after != before {
+				t.Fatalf("refused IS NULL made %d request(s)", after-before)
+			}
+		})
+	}
+}
+
+// TestIndexErrorCodesMapToErrIndexRequired proves both CouchDB error codes that
+// mean "no usable Mango index under allow_fallback:false" surface as the
+// adapter's sentinel without leaking the response reason.
+func TestIndexErrorCodesMapToErrIndexRequired(t *testing.T) {
+	const secret = "selector-detail-secret"
+	for _, code := range []string{"no_usable_index", "invalid_index"} {
+		t.Run(code, func(t *testing.T) {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"` + code + `","reason":"` + secret + `"}`))
+			})
+			db := newTestDB(t, handler)
+			reader, err := db.ExecuteQueryToRecordsReader(context.Background(),
+				appQuery().Limit(1).SelectIntoRecord(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = reader.Next()
+			if !errors.Is(err, ErrIndexRequired) {
+				t.Fatalf("error = %v; want ErrIndexRequired", err)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("error leaked the response reason: %v", err)
+			}
+		})
 	}
 }
 
@@ -994,10 +1185,10 @@ func TestRecordsetReaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	rs := reader.Recordset()
-	if rs.Name() != "custom" || rs.RowsCount() != 2 || rs.ColumnsCount() != 3 {
+	if rs.Name() != "custom" || rs.RowsCount() != 2 || rs.ColumnsCount() != 2 {
 		t.Fatalf("recordset name=%q rows=%d columns=%d", rs.Name(), rs.RowsCount(), rs.ColumnsCount())
 	}
-	if names := []string{rs.GetColumnByIndex(0).Name(), rs.GetColumnByIndex(1).Name(), rs.GetColumnByIndex(2).Name()}; !reflect.DeepEqual(names, []string{"name", "score", "_rev"}) {
+	if names := []string{rs.GetColumnByIndex(0).Name(), rs.GetColumnByIndex(1).Name()}; !reflect.DeepEqual(names, []string{"name", "score"}) {
 		t.Fatalf("columns = %v", names)
 	}
 	row, _, err := reader.Next()
@@ -1024,10 +1215,10 @@ func TestRecordsetReaders(t *testing.T) {
 		t.Fatal(err)
 	}
 	empty := emptyReader.Recordset()
-	if empty.RowsCount() != 0 || empty.ColumnsCount() != 3 {
+	if empty.RowsCount() != 0 || empty.ColumnsCount() != 2 {
 		t.Fatalf("empty recordset rows=%d columns=%d", empty.RowsCount(), empty.ColumnsCount())
 	}
-	if names := []string{empty.GetColumnByIndex(0).Name(), empty.GetColumnByIndex(1).Name(), empty.GetColumnByIndex(2).Name()}; !reflect.DeepEqual(names, []string{"name", "score", "_rev"}) {
+	if names := []string{empty.GetColumnByIndex(0).Name(), empty.GetColumnByIndex(1).Name()}; !reflect.DeepEqual(names, []string{"name", "score"}) {
 		t.Fatalf("empty columns = %v", names)
 	}
 
@@ -1353,9 +1544,9 @@ func projectionHandler(t *testing.T, docs []map[string]any) http.Handler {
 	})
 }
 
-// TestProjectionKeepsRequestedIDColumn proves an explicit _id projection keeps
-// its output column and is materialized from the native record key rather than
-// silently disappearing.
+// TestProjectionKeepsRequestedIDColumn proves a projection exposes exactly the
+// declared columns in declaration order: an explicit _id column is materialized
+// from the native record key, and _rev appears only when it was declared.
 func TestProjectionKeepsRequestedIDColumn(t *testing.T) {
 	docs := []map[string]any{
 		{"_id": "doc-1", "_rev": "1-a", "name": "tea", "score": 10},
@@ -1371,8 +1562,11 @@ func TestProjectionKeepsRequestedIDColumn(t *testing.T) {
 			t.Fatal(err)
 		}
 		rs := reader.Recordset()
-		if names := columnNames(rs); !reflect.DeepEqual(names, []string{"_id", "_rev"}) {
+		if names := columnNames(rs); !reflect.DeepEqual(names, []string{"_id"}) {
 			t.Fatalf("columns = %v", names)
+		}
+		if rs.GetColumnByName("_rev") != nil {
+			t.Fatal("unrequested _rev column was fabricated")
 		}
 		if rs.GetColumnByName("name") != nil {
 			t.Fatal("unrequested column was fabricated")
@@ -1384,10 +1578,6 @@ func TestProjectionKeepsRequestedIDColumn(t *testing.T) {
 		id, err := row.GetValueByName("_id", rs)
 		if err != nil || id != "doc-1" {
 			t.Fatalf("_id = %#v err=%v", id, err)
-		}
-		rev, err := row.GetValueByName("_rev", rs)
-		if err != nil || rev != "1-a" {
-			t.Fatalf("_rev = %#v err=%v", rev, err)
 		}
 	})
 
@@ -1404,8 +1594,72 @@ func TestProjectionKeepsRequestedIDColumn(t *testing.T) {
 		if rec.Key().ID != "doc-1" {
 			t.Fatalf("key ID = %v", rec.Key().ID)
 		}
-		if data := dataOf(t, rec); len(data) != 1 || data["_rev"] != "1-a" {
-			t.Fatalf("data = %#v", data)
+		if data := dataOf(t, rec); len(data) != 0 {
+			t.Fatalf("id-only data = %#v; want no row fields", data)
+		}
+	})
+
+	t.Run("name-only-records", func(t *testing.T) {
+		reader, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(2).
+			SelectColumns(dal.Column{Expression: dal.Field("name")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := reader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Key().ID != "doc-1" {
+			t.Fatalf("key ID = %v", rec.Key().ID)
+		}
+		if data := dataOf(t, rec); !reflect.DeepEqual(data, map[string]any{"name": "tea"}) {
+			t.Fatalf("name-only data = %#v; want exactly name", data)
+		}
+	})
+
+	t.Run("explicit-rev", func(t *testing.T) {
+		reader, err := db.ExecuteQueryToRecordsetReader(ctx, appQuery().Limit(2).
+			SelectColumns(
+				dal.Column{Expression: dal.Field("_rev")},
+				dal.Column{Expression: dal.Field("name")},
+			))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rs := reader.Recordset()
+		if names := columnNames(rs); !reflect.DeepEqual(names, []string{"_rev", "name"}) {
+			t.Fatalf("columns = %v", names)
+		}
+		if rs.GetColumnByName("_id") != nil {
+			t.Fatal("explicit _rev projection fabricated an _id column")
+		}
+		row, _, err := reader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rev, err := row.GetValueByName("_rev", rs)
+		if err != nil || rev != "1-a" {
+			t.Fatalf("_rev = %#v err=%v", rev, err)
+		}
+		name, _ := row.GetValueByName("name", rs)
+		if name != "tea" {
+			t.Fatalf("name = %#v", name)
+		}
+
+		records, err := db.ExecuteQueryToRecordsReader(ctx, appQuery().Limit(2).
+			SelectColumns(dal.Column{Expression: dal.Field("_rev")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec, err := records.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Key().ID != "doc-1" {
+			t.Fatalf("key ID = %v", rec.Key().ID)
+		}
+		if data := dataOf(t, rec); !reflect.DeepEqual(data, map[string]any{"_rev": "1-a"}) {
+			t.Fatalf("explicit _rev data = %#v", data)
 		}
 	})
 
@@ -1419,7 +1673,7 @@ func TestProjectionKeepsRequestedIDColumn(t *testing.T) {
 			t.Fatal(err)
 		}
 		rs := reader.Recordset()
-		if names := columnNames(rs); !reflect.DeepEqual(names, []string{"name", "_id", "_rev"}) {
+		if names := columnNames(rs); !reflect.DeepEqual(names, []string{"name", "_id"}) {
 			t.Fatalf("columns = %v", names)
 		}
 		row, _, err := reader.Next()
@@ -1445,6 +1699,16 @@ func TestProjectionKeepsRequestedIDColumn(t *testing.T) {
 		if rs.GetColumnByName("_id") != nil {
 			t.Fatal("wildcard recordset fabricated an _id column instead of using the record key")
 		}
+		row, _, err := reader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rev, _ := row.GetValueByName("_rev", rs)
+		name, _ := row.GetValueByName("name", rs)
+		score, _ := row.GetValueByName("score", rs)
+		if rev != "1-a" || name != "tea" || score != int64(10) {
+			t.Fatalf("wildcard row rev=%#v name=%#v score=%#v", rev, name, score)
+		}
 	})
 
 	t.Run("wildcard-records", func(t *testing.T) {
@@ -1459,9 +1723,9 @@ func TestProjectionKeepsRequestedIDColumn(t *testing.T) {
 		if rec.Key().ID != "doc-1" {
 			t.Fatalf("key ID = %v", rec.Key().ID)
 		}
-		data := dataOf(t, rec)
-		if data["name"] != "tea" || data["_rev"] != "1-a" {
-			t.Fatalf("data = %#v", data)
+		want := map[string]any{"_rev": "1-a", "name": "tea", "score": int64(10)}
+		if data := dataOf(t, rec); !reflect.DeepEqual(data, want) {
+			t.Fatalf("wildcard data = %#v; want %#v", data, want)
 		}
 	})
 }

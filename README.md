@@ -65,8 +65,15 @@ configuration.
 
 - CouchDB `_id` is the DALgo record key. It is stable native identity; for
   example `record.NewKeyWithID("orders", "order-42")`.
-- `_rev` is returned as document metadata in the record data map. There is no
-  separate metadata channel in `dal.Record`.
+- `_rev` is document metadata. `Get`/`GetMulti` return it in the record data
+  map because there is no separate metadata channel in `dal.Record`. A
+  structured projection exposes `_rev` only when the caller declares it.
+- Native `null` and an absent field are different to CouchDB. An explicit
+  `field == nil` comparison maps to native `$eq: null` and matches only
+  documents that carry an explicit `null`; it does not match documents where
+  the field is missing. `dal.IsNullCondition` has uniform DALgo semantics (an
+  absent field is NULL) and is therefore refused before any request; see
+  [structured queries](#structured-queries).
 - `_id` is not duplicated inside the data map; it is the key.
 - Native JSON types are preserved: 64-bit integers become `int64` where they
   fit, other numbers become `float64`, integers wider than `int64` stay
@@ -115,7 +122,8 @@ bounded limit**. Supported translation is intentionally small:
 - one root collection; no parent, schema, database alias, joins or subqueries
 - simple top-level field names, plus `_id`/`_rev`
 - comparisons `==`, `>`, `>=`, `<`, `<=` (mapped to `$eq`, `$gt`, `$gte`,
-  `$lt`, `$lte`), `IN`/`NOT IN` with arrays, `IS NULL`/`IS NOT NULL`
+  `$lt`, `$lte`), `IN`/`NOT IN` with arrays
+- `IS NOT NULL`, mapped to Mango `$ne: null` (present and not null)
 - `AND`/`OR` groups with a depth/node budget
 - projection of simple fields
 - ordering with a single direction for all keys
@@ -126,9 +134,14 @@ bounded limit**. Supported translation is intentionally small:
 Joins, grouping, `HAVING`, aggregate columns, subqueries, wildcard or aliased
 projections, nested/dotted fields, mixed sort directions, text/raw Mango, raw
 URLs and management endpoints are rejected with `dal.ErrNotSupported` **before
-any request** when validated by the adapter. The generic DALgo aggregation
-fallback supplies a source limit of `0`; this adapter refuses it rather than
-silently aggregating a capped partial source.
+any request** when validated by the adapter. `IS NULL` is also rejected before
+any request: DALgo defines it to match an absent field as well as an explicit
+null, a JSON index only contains documents where the indexed field is present,
+and this adapter never falls back to the `_all_docs` primary scan. Use an
+explicit `field == nil` comparison for explicit nulls, or `IS NOT NULL` for
+present, non-null values. The generic DALgo aggregation fallback supplies a
+source limit of `0`; this adapter refuses it rather than silently aggregating a
+capped partial source.
 
 ```go
 q := dal.From(dal.NewRootCollectionRef("orders", "")).NewQuery().
@@ -154,20 +167,26 @@ for {
 ```
 
 `ExecuteQueryToRecordsetReader` materializes the same bounded result into a
-`recordset.Recordset`. A projected query keeps its declared columns in order
-(plus `_rev`); an explicitly requested `_id` column is materialized from the
-native record key rather than dropped. An unprojected query uses the sorted
-union of returned native fields and leaves identity on the record key.
-`recordset.WithName` overrides the recordset name.
+`recordset.Recordset`. A projected query returns exactly its declared columns,
+in declaration order: `_rev` (and any other undeclared native field) is
+available to the adapter for identity/revision validation but is not exposed,
+unless the caller declares `_rev`. An explicitly requested `_id` column is
+materialized from the native record key rather than dropped, and `_id` is never
+duplicated in record data. An unprojected query uses the sorted union of
+returned native fields (including `_rev`) and leaves identity on the record
+key. `recordset.WithName` overrides the recordset name.
 
 ### Mango indexes and sorting
 
 The adapter always sends `allow_fallback: false`. A structured query must be
 served by a real Mango index; CouchDB's implicit primary scan or a silent
 fallback is not used. When no usable index exists, CouchDB's
-`no_usable_index` response becomes `dalgo2couchdb.ErrIndexRequired` with only a
-safe message. Sorting requires an index with the sort fields in the same order;
-CouchDB Mango also requires all sort directions to match.
+`no_usable_index` and `invalid_index` responses both become
+`dalgo2couchdb.ErrIndexRequired` with only a safe message. Sorting requires an
+index with the sort fields in the same order; CouchDB Mango also requires all
+sort directions to match. An `OR` whose branches need different indexes can
+therefore fail with `ErrIndexRequired` even though each branch alone is
+queryable.
 
 Create indexes outside the adapter (for example with the CouchDB HTTP API, an
 administrator, or your deployment tooling). The adapter never creates indexes.
@@ -254,8 +273,10 @@ response bodies.
 The real-service test is designed for an owned disposable container (started by
 the shell recipe below). It seeds native documents and Mango indexes, creates a
 non-admin reader member, and exercises real `Get`/`Exists`/`GetMulti`,
-filter/sort/projection, several bookmark pages, the schema/index endpoint, an
-index-required failure and bad credentials.
+filter/sort/projection (including id-only, explicit `_rev`, mixed order and
+wildcard), several bookmark pages, native null versus `IS NOT NULL` and the
+`IS NULL` refusal, the schema/index endpoint, an index-required failure and bad
+credentials.
 
 ```sh
 RUN=$(date +%s)

@@ -36,18 +36,20 @@ func TestRealCouchDB(t *testing.T) {
 	ensureReaderUser(t, ctx, base, adminAuth, readerUser, readerPassword)
 	grantMemberAccess(t, ctx, base, dbName, adminAuth, readerUser)
 	seed := []map[string]any{
-		{"_id": "doc-1", "kind": "product", "status": "active", "name": "alpha", "score": 50, "price": 1.5, "active": true, "note": nil},
-		{"_id": "doc-2", "kind": "product", "status": "active", "name": "bravo", "score": 40, "price": 2.5, "active": false, "note": "n2"},
-		{"_id": "doc-3", "kind": "product", "status": "active", "name": "charlie", "score": 30, "price": 3.5, "active": true, "note": nil},
-		{"_id": "doc-4", "kind": "product", "status": "active", "name": "delta", "score": 20, "price": 4.5, "active": false, "note": "n4"},
-		{"_id": "doc-5", "kind": "product", "status": "active", "name": "echo", "score": 10, "price": 5.5, "active": true, "note": nil},
+		{"_id": "doc-1", "kind": "product", "status": "active", "name": "alpha", "score": 50, "price": 1.5, "active": true, "note": nil, "nullable": nil},
+		{"_id": "doc-2", "kind": "product", "status": "active", "name": "bravo", "score": 40, "price": 2.5, "active": false, "note": "n2", "nullable": "n2"},
+		{"_id": "doc-3", "kind": "product", "status": "active", "name": "charlie", "score": 30, "price": 3.5, "active": true, "note": nil, "nullable": nil},
+		{"_id": "doc-4", "kind": "product", "status": "active", "name": "delta", "score": 20, "price": 4.5, "active": false, "note": "n4", "nullable": "n4"},
+		{"_id": "doc-5", "kind": "product", "status": "active", "name": "echo", "score": 10, "price": 5.5, "active": true, "note": nil, "nullable": nil},
 		{"_id": "doc-6", "kind": "product", "status": "active", "name": "foxtrot", "score": 5, "price": 6.5, "active": true, "note": nil},
-		{"_id": "doc-7", "kind": "product", "status": "archived", "name": "golf", "score": 60, "price": 7.5, "active": true, "note": nil},
+		{"_id": "doc-7", "kind": "product", "status": "archived", "name": "golf", "score": 60, "price": 7.5, "active": true, "note": nil, "nullable": "n7"},
 		{"_id": "native/slash", "kind": "other", "status": "other", "name": "slash", "score": 1, "price": 0.5, "active": false, "note": nil},
 	}
 	bulkDocs(t, ctx, base, dbName, adminAuth, seed)
 	createIndex(t, ctx, base, dbName, adminAuth, "score-index", []string{"score"})
 	createIndex(t, ctx, base, dbName, adminAuth, "status-score-index", []string{"status", "score"})
+	createIndex(t, ctx, base, dbName, adminAuth, "nullable-index", []string{"nullable"})
+	createIndex(t, ctx, base, dbName, adminAuth, "status-nullable-index", []string{"status", "nullable"})
 
 	cfg := Config{
 		DatabaseURL:       base + "/" + dbName,
@@ -169,8 +171,8 @@ func TestRealCouchDB(t *testing.T) {
 		if rec.Key().ID != "doc-1" {
 			t.Fatalf("key ID = %v", rec.Key().ID)
 		}
-		if data := dataOf(t, rec); len(data) != 1 || data["_rev"] == nil {
-			t.Fatalf("id-only record data = %#v", data)
+		if data := dataOf(t, rec); len(data) != 0 {
+			t.Fatalf("id-only record data = %#v; want no row fields", data)
 		}
 		_ = recordsReader.Close()
 
@@ -180,7 +182,7 @@ func TestRealCouchDB(t *testing.T) {
 		}
 		rs := reader.Recordset()
 		names := columnNames(rs)
-		if !reflect.DeepEqual(names, []string{"_id", "_rev"}) {
+		if !reflect.DeepEqual(names, []string{"_id"}) {
 			t.Fatalf("id-only columns = %v", names)
 		}
 		row := rs.GetRow(0)
@@ -189,21 +191,80 @@ func TestRealCouchDB(t *testing.T) {
 			t.Fatalf("_id = %#v err=%v", id, err)
 		}
 
+		nameOnly, err := db.ExecuteQueryToRecordsetReader(ctx, dal.From(dal.NewRootCollectionRef(dbName, "")).NewQuery().
+			WhereField("status", dal.Equal, "active").
+			WhereField("score", dal.GreaterOrEqual, 0).
+			OrderBy(dal.DescendingField("score")).
+			Limit(2).
+			SelectColumns(dal.Column{Expression: dal.Field("name")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		nameRS := nameOnly.Recordset()
+		if names = columnNames(nameRS); !reflect.DeepEqual(names, []string{"name"}) {
+			t.Fatalf("name-only columns = %v", names)
+		}
+		if nameRS.GetColumnByName("_rev") != nil {
+			t.Fatal("name-only projection fabricated a _rev column")
+		}
+		nameReader, err := db.ExecuteQueryToRecordsReader(ctx, dal.From(dal.NewRootCollectionRef(dbName, "")).NewQuery().
+			WhereField("status", dal.Equal, "active").
+			WhereField("score", dal.GreaterOrEqual, 0).
+			OrderBy(dal.DescendingField("score")).
+			Limit(1).
+			SelectColumns(dal.Column{Expression: dal.Field("name")}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		nameRecord, err := nameReader.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = nameReader.Close()
+		if data := dataOf(t, nameRecord); !reflect.DeepEqual(data, map[string]any{"name": "alpha"}) {
+			t.Fatalf("name-only record data = %#v; want exactly name", data)
+		}
+
+		explicitRev, err := db.ExecuteQueryToRecordsetReader(ctx, dal.From(dal.NewRootCollectionRef(dbName, "")).NewQuery().
+			WhereField("status", dal.Equal, "active").
+			WhereField("score", dal.GreaterOrEqual, 0).
+			OrderBy(dal.DescendingField("score")).
+			Limit(2).
+			SelectColumns(
+				dal.Column{Expression: dal.Field("_rev")},
+				dal.Column{Expression: dal.Field("name")},
+			))
+		if err != nil {
+			t.Fatal(err)
+		}
+		revRS := explicitRev.Recordset()
+		if names = columnNames(revRS); !reflect.DeepEqual(names, []string{"_rev", "name"}) {
+			t.Fatalf("explicit _rev columns = %v", names)
+		}
+		revRow := revRS.GetRow(0)
+		rev, err := revRow.GetValueByName("_rev", revRS)
+		if err != nil || rev == nil || rev == "" {
+			t.Fatalf("_rev = %#v err=%v", rev, err)
+		}
+		if name, _ := revRow.GetValueByName("name", revRS); name != "alpha" {
+			t.Fatalf("explicit _rev name = %#v", name)
+		}
+
 		mixedQuery := dal.From(dal.NewRootCollectionRef(dbName, "")).NewQuery().
 			WhereField("status", dal.Equal, "active").
 			WhereField("score", dal.GreaterOrEqual, 0).
 			OrderBy(dal.DescendingField("score")).
 			Limit(2).
 			SelectColumns(
-				dal.Column{Expression: dal.Field("_id")},
 				dal.Column{Expression: dal.Field("name")},
+				dal.Column{Expression: dal.Field("_id")},
 			)
 		mixed, err := db.ExecuteQueryToRecordsetReader(ctx, mixedQuery)
 		if err != nil {
 			t.Fatal(err)
 		}
 		mixedRS := mixed.Recordset()
-		if names = columnNames(mixedRS); !reflect.DeepEqual(names, []string{"_id", "name", "_rev"}) {
+		if names = columnNames(mixedRS); !reflect.DeepEqual(names, []string{"name", "_id"}) {
 			t.Fatalf("mixed columns = %v", names)
 		}
 		mixedRow := mixedRS.GetRow(0)
@@ -234,13 +295,141 @@ func TestRealCouchDB(t *testing.T) {
 		}
 	})
 
+	t.Run("is-null-and-native-null-comparison", func(t *testing.T) {
+		activeQuery := func() dal.IQueryBuilder {
+			return dal.From(dal.NewRootCollectionRef(dbName, "")).NewQuery().
+				WhereField("status", dal.Equal, "active").
+				OrderBy(dal.AscendingField("score")).
+				Limit(10)
+		}
+		ids := func(query dal.Query) []string {
+			t.Helper()
+			reader, err := db.ExecuteQueryToRecordsReader(ctx, query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = reader.Close() }()
+			var ids []string
+			for {
+				rec, err := reader.Next()
+				if errors.Is(err, dal.ErrNoMoreRecords) {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				id, ok := rec.Key().ID.(string)
+				if !ok {
+					t.Fatalf("key ID is %T, want string", rec.Key().ID)
+				}
+				ids = append(ids, id)
+			}
+			return ids
+		}
+
+		// Native adapter semantics: an explicit == nil is Mango $eq:null and
+		// matches only documents that carry an explicit null, never a document
+		// with the field absent (doc-6).
+		explicitNull := ids(activeQuery().
+			WhereField("nullable", dal.Equal, nil).
+			SelectColumns(dal.Column{Expression: dal.Field("_id")}))
+		if !reflect.DeepEqual(explicitNull, []string{"doc-5", "doc-3", "doc-1"}) {
+			t.Fatalf("explicit null ids = %v", explicitNull)
+		}
+
+		// IS NOT NULL is exactly expressible: present and non-null only.
+		notNull := ids(activeQuery().
+			Where(dal.Field("nullable").IsNotNull()).
+			SelectColumns(dal.Column{Expression: dal.Field("_id")}))
+		if !reflect.DeepEqual(notNull, []string{"doc-4", "doc-2"}) {
+			t.Fatalf("IS NOT NULL ids = %v", notNull)
+		}
+
+		// IS NULL must count doc-6 (absent) as NULL as well; Mango cannot
+		// serve that through an index, so the adapter refuses before I/O
+		// instead of returning explicit nulls only.
+		nullQuery := activeQuery().
+			Where(dal.Field("nullable").IsNull()).
+			SelectColumns(dal.Column{Expression: dal.Field("_id")})
+		if _, err := db.ExecuteQueryToRecordsReader(ctx, nullQuery); !errors.Is(err, dal.ErrNotSupported) {
+			t.Fatalf("IS NULL error = %v; want ErrNotSupported", err)
+		}
+		if _, err := db.ExecuteQueryToRecordsetReader(ctx, nullQuery); !errors.Is(err, dal.ErrNotSupported) {
+			t.Fatalf("IS NULL recordset error = %v; want ErrNotSupported", err)
+		}
+
+		// The exact Mango translation CouchDB would need (explicit null OR
+		// absent) has no usable index under allow_fallback:false, which is why
+		// the adapter refuses it rather than silently dropping absent fields.
+		status, body, err := integrationRequest(ctx, http.MethodPost, base+"/"+dbName+"/_find", readerAuth, "application/json", map[string]any{
+			"selector": map[string]any{"$or": []any{
+				map[string]any{"nullable": map[string]any{"$eq": nil}},
+				map[string]any{"nullable": map[string]any{"$exists": false}},
+			}},
+			"fields":         []string{"_id"},
+			"limit":          10,
+			"allow_fallback": false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status != http.StatusBadRequest || !bytes.Contains(body, []byte(`"invalid_index"`)) {
+			t.Fatalf("raw IS NULL translation status=%d body=%s", status, body)
+		}
+
+		// IS NOT NULL is served by the real nullable index, not by _all_docs.
+		status, body, err = integrationRequest(ctx, http.MethodPost, base+"/"+dbName+"/_explain", readerAuth, "application/json", map[string]any{
+			"selector":       map[string]any{"nullable": map[string]any{"$ne": nil}},
+			"fields":         []string{"_id"},
+			"limit":          10,
+			"allow_fallback": false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var explained struct {
+			Index struct {
+				Name string `json:"name"`
+			} `json:"index"`
+		}
+		if status != http.StatusOK {
+			t.Fatalf("explain status=%d body=%s", status, body)
+		}
+		if err = json.Unmarshal(body, &explained); err != nil {
+			t.Fatal(err)
+		}
+		if explained.Index.Name != "nullable-index" {
+			t.Fatalf("IS NOT NULL explain index = %q; want nullable-index", explained.Index.Name)
+		}
+
+		// An OR across different fields cannot share one Mango index; the
+		// adapter reports the honest ErrIndexRequired rather than scanning.
+		orQuery := dal.From(dal.NewRootCollectionRef(dbName, "")).NewQuery().
+			Where(dal.NewGroupCondition(dal.Or,
+				dal.Field("nullable").IsNotNull(),
+				dal.WhereField("score", dal.LessThen, 15))).
+			Limit(10).
+			SelectIntoRecord(nil)
+		orReader, err := db.ExecuteQueryToRecordsReader(ctx, orQuery)
+		if err != nil {
+			if !errors.Is(err, ErrIndexRequired) {
+				t.Fatalf("OR error = %v; want ErrIndexRequired", err)
+			}
+			return
+		}
+		defer func() { _ = orReader.Close() }()
+		if _, err = orReader.Next(); !errors.Is(err, ErrIndexRequired) {
+			t.Fatalf("OR next error = %v; want ErrIndexRequired", err)
+		}
+	})
+
 	t.Run("recordset", func(t *testing.T) {
 		reader, err := db.ExecuteQueryToRecordsetReader(ctx, query(), recordset.WithName("products"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		rs := reader.Recordset()
-		if rs.Name() != "products" || rs.RowsCount() != 5 || rs.ColumnsCount() != 3 {
+		if rs.Name() != "products" || rs.RowsCount() != 5 || rs.ColumnsCount() != 2 {
 			t.Fatalf("name=%q rows=%d columns=%d", rs.Name(), rs.RowsCount(), rs.ColumnsCount())
 		}
 	})

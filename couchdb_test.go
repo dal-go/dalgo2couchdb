@@ -170,7 +170,10 @@ func TestConfigValidation(t *testing.T) {
 			t.Fatalf("config error leaked a secret: %v", err)
 		}
 	}
-	if _, err := NewDB(nil, valid[0]); err == nil {
+	// NewDB must reject a nil context. Keep the typed nil so the check is
+	// still a real nil-interface proof without an untyped nil argument.
+	var nilContext context.Context
+	if _, err := NewDB(nilContext, valid[0]); err == nil {
 		t.Fatal("nil context accepted")
 	}
 }

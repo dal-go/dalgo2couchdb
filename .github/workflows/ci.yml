@@ -1,0 +1,47 @@
+name: Go CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      couchdb:
+        image: apache/couchdb:3.5.3@sha256:d6bc2568f38d9f568afdc09cb33b871608db861201d885e34769878049da43f2
+        env:
+          COUCHDB_USER: datatug-admin
+          COUCHDB_PASSWORD: datatug-test-admin
+        ports:
+          - 5984:5984
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Wait for CouchDB
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:5984/_up >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "CouchDB did not become ready" >&2
+          exit 1
+      - name: Test
+        run: go test -race -count=1 ./...
+        env:
+          COUCHDB_TEST_URL: http://127.0.0.1:5984/datatug_couchdb_test
+          COUCHDB_TEST_ADMIN_USER: datatug-admin
+          COUCHDB_TEST_ADMIN_PASSWORD: datatug-test-admin
+          COUCHDB_TEST_READER_USER: datatug-reader
+          COUCHDB_TEST_READER_PASSWORD: datatug-test-reader
+      - name: Vet
+        run: go vet ./...
+      - name: Format
+        run: test -z "$(gofmt -l .)"

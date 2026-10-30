@@ -3,7 +3,7 @@ module github.com/dal-go/dalgo2couchdb
 go 1.27.1
 
 require (
-	github.com/dal-go/dalgo v0.95.4
+	github.com/dal-go/dalgo v0.96.2
 	github.com/dal-go/record v0.1.5
 )
 
